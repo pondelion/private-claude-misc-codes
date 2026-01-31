@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 
-
 class DKD(nn.Module):
     """
     Differentiable Keypoint Detection (DKD)
@@ -48,7 +47,6 @@ class DKD(nn.Module):
         self.scores_th = scores_th
         self.n_limit = n_limit
         self.temperature = temperature
-
 
     def forward(
         self,
@@ -83,7 +81,6 @@ class DKD(nn.Module):
         for _ in range(2):
             nms_map = self._simple_nms(nms_map, kernel_size=2 * self.radius + 1)
         # nms_map: (B, 1, H, W) - NMS後のスコア
-
 
         # ========================================
         # Step 2: Thresholding & Top-K Selection
@@ -121,7 +118,6 @@ class DKD(nn.Module):
             kpts_pix = torch.stack([x_pix, y_pix], dim=-1).float()
             # kpts_pix: (N, 2)
 
-
             # ========================================
             # Step 3: Soft-argmax Refinement
             # ========================================
@@ -133,7 +129,6 @@ class DKD(nn.Module):
                 window_size=2 * self.radius + 1
             )
             # kpts_refined: (N, 2) - Sub-pixel座標 [x, y]
-
 
             keypoints_list.append(kpts_refined)
             scores_list.append(valid_scores)
@@ -150,7 +145,6 @@ class DKD(nn.Module):
             scores[b, :n] = scores_list[b]
 
         return keypoints, scores
-
 
     def _simple_nms(
         self,
@@ -184,7 +178,6 @@ class DKD(nn.Module):
         )
 
         return nms_map
-
 
     def _soft_argmax_refine(
         self,
@@ -273,7 +266,7 @@ class DKD(nn.Module):
             # weights: (patch_h * patch_w,)
 
             # 重み付き平均
-            grid_flat = grid_patch.view(-1, 2)
+            grid_flat = grid_patch.reshape(-1, 2)
             refined_offset = (weights.unsqueeze(1) * grid_flat).sum(dim=0)
             # refined_offset: (2,) - [dx, dy]
 
@@ -287,7 +280,6 @@ class DKD(nn.Module):
         # keypoints_refined: (N, 2)
 
         return keypoints_refined
-
 
     def compute_score_dispersity(
         self,
@@ -363,7 +355,6 @@ class DKD(nn.Module):
 
         return dispersity
 
-
 # ============================================
 # 使用例
 # ============================================
@@ -402,7 +393,6 @@ def example_dkd():
     dispersity = dkd.compute_score_dispersity(score_map, keypoints)
     print(f"Dispersity: {dispersity.shape}")  # (2, 500)
     print(f"Mean dispersity: {dispersity[dispersity > 0].mean():.4f}")
-
 
 if __name__ == "__main__":
     example_dkd()

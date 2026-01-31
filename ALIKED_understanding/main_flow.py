@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple
 
-
 class ALIKED(nn.Module):
     """
     ALIKED: A Lighter Keypoint and Descriptor Extraction Network
@@ -69,7 +68,6 @@ class ALIKED(nn.Module):
         self.pool4 = nn.AvgPool2d(kernel_size=4, stride=4)
         self.block4 = ResBlock(c3, c4, use_dcn=True)
 
-
         # ========================================
         # 2. Feature Aggregation
         # ========================================
@@ -83,7 +81,6 @@ class ALIKED(nn.Module):
         )
 
         # Concatenation後の特徴: dim channels
-
 
         # ========================================
         # 3. Score Map Head (SMH)
@@ -99,7 +96,6 @@ class ALIKED(nn.Module):
             nn.Sigmoid()
         )
 
-
         # ========================================
         # 4. Differentiable Keypoint Detection (DKD)
         # ========================================
@@ -111,7 +107,6 @@ class ALIKED(nn.Module):
             n_limit=20000       # 制限
         )
 
-
         # ========================================
         # 5. Sparse Deformable Descriptor Head (SDDH)
         # ========================================
@@ -122,7 +117,6 @@ class ALIKED(nn.Module):
             M=M,                # デフォーマブルサンプル位置数
             K=K                 # パッチサイズ
         )
-
 
     def forward(
         self,
@@ -172,7 +166,6 @@ class ALIKED(nn.Module):
         x4 = self.block4(x4)
         # x4: (B, c4, H/32, W/32)
 
-
         # ========================================
         # Step 2: Feature Aggregation
         # ========================================
@@ -187,14 +180,12 @@ class ALIKED(nn.Module):
         features = torch.cat([f1, f2, f3, f4], dim=1)
         # features: (B, dim, H, W)
 
-
         # ========================================
         # Step 3: Score Map Estimation
         # ========================================
 
         score_map = self.score_head(features)
         # score_map: (B, 1, H, W)
-
 
         # ========================================
         # Step 4: Differentiable Keypoint Detection (DKD)
@@ -208,7 +199,6 @@ class ALIKED(nn.Module):
         # keypoints: (B, N, 2) - sub-pixel座標 [x, y]
         # scores: (B, N) - キーポイントスコア
 
-
         # ========================================
         # Step 5: Sparse Deformable Descriptor Head (SDDH)
         # ========================================
@@ -216,14 +206,12 @@ class ALIKED(nn.Module):
         descriptors = self.sddh(features, keypoints)
         # descriptors: (B, N, dim)
 
-
         return {
             'keypoints': keypoints,
             'descriptors': descriptors,
             'scores': scores,
             'score_map': score_map
         }
-
 
     def extract_dense_map(
         self,
@@ -261,7 +249,6 @@ class ALIKED(nn.Module):
 
         return features, score_map
 
-
 class UpsampleBlock(nn.Module):
     """アップサンプリングブロック"""
 
@@ -272,6 +259,7 @@ class UpsampleBlock(nn.Module):
         self.scale = scale
 
     def forward(self, x):
+        # 公式実装に合わせて、先にチャネル削減してからupsample
         x = self.conv(x)
         x = nn.functional.selu(x)
 
@@ -285,13 +273,12 @@ class UpsampleBlock(nn.Module):
 
         return x
 
-
 # ============================================
 # 使用例
 # ============================================
 
-def example_usage():
-    """ALIKED使用例"""
+def example_aliked_usage():
+    """ALIKED使用例（CPU 12GBでも動作するように調整）"""
 
     # モデル作成 (Normal-16)
     model = ALIKED(
@@ -300,26 +287,30 @@ def example_usage():
         M=16,
         K=3
     )
+    model.eval()  # 評価モード
 
-    # ダミー入力
-    images = torch.randn(2, 3, 640, 480)
+    # ダミー入力（32で割り切れるサイズ: 256x320）
+    # バッチサイズも 2 → 1 に削減
+    images = torch.randn(1, 3, 256, 320)
 
-    # フォワードパス
-    outputs = model(images, top_k=1000, scores_th=0.2)
+    # フォワードパス（勾配計算を無効化してメモリ節約）
+    with torch.no_grad():
+        # top_k も削減: 1000 → 300
+        outputs = model(images, top_k=300, scores_th=0.2)
 
-    print(f"Keypoints: {outputs['keypoints'].shape}")      # (2, N, 2)
-    print(f"Descriptors: {outputs['descriptors'].shape}")  # (2, N, 128)
-    print(f"Scores: {outputs['scores'].shape}")            # (2, N)
-    print(f"Score map: {outputs['score_map'].shape}")      # (2, 1, 640, 480)
+    print(f"Keypoints: {outputs['keypoints'].shape}")      # (1, N, 2)
+    print(f"Descriptors: {outputs['descriptors'].shape}")  # (1, N, 128)
+    print(f"Scores: {outputs['scores'].shape}")            # (1, N)
+    print(f"Score map: {outputs['score_map'].shape}")      # (1, 1, 256, 320)
 
-
-    # 画像マッチング例
-    img_a = torch.randn(1, 3, 640, 480)
-    img_b = torch.randn(1, 3, 640, 480)
+    # 画像マッチング例（同じく小さいサイズで）
+    img_a = torch.randn(1, 3, 256, 320)
+    img_b = torch.randn(1, 3, 256, 320)
 
     # キーポイント・記述子抽出
-    out_a = model(img_a)
-    out_b = model(img_b)
+    with torch.no_grad():
+        out_a = model(img_a, top_k=300, scores_th=0.2)
+        out_b = model(img_b, top_k=300, scores_th=0.2)
 
     # Mutual Nearest Neighbor (mNN) マッチング
     desc_a = out_a['descriptors'][0]  # (N_a, 128)
@@ -341,6 +332,5 @@ def example_usage():
 
     print(f"Number of matches: {matches_a.shape[0]}")
 
-
 if __name__ == "__main__":
-    example_usage()
+    example_aliked_usage()

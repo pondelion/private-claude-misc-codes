@@ -14,15 +14,15 @@ ALIKEDは2種類のデータセットで訓練:
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.utils.data import Dataset
 from typing import Dict, Tuple
 from pathlib import Path
-
 
 # ============================================
 # 1. Homographicデータセット
 # ============================================
 
-class HomographicDataset:
+class HomographicDataset(Dataset):
     """
     Homographicデータセット
 
@@ -51,9 +51,12 @@ class HomographicDataset:
     ⚠️ 重要: カメラパラメータ不要!
     """
 
-    def __init__(self, image_dir: str):
+    def __init__(self, image_dir: str, image_size: Tuple[int, int] = (512, 512)):
         self.image_paths = list(Path(image_dir).glob('*.jpg'))
+        self.image_size = image_size  # (H, W)
 
+    def __len__(self) -> int:
+        return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Dict:
         """
@@ -80,7 +83,6 @@ class HomographicDataset:
         image = self._load_image(self.image_paths[idx])
         # image: (3, H, W) - RGB画像
 
-
         # ========================================
         # Step 2: ランダムHomography生成
         # ========================================
@@ -93,7 +95,6 @@ class HomographicDataset:
         )
         # H_ab: (3, 3) - Homography行列
 
-
         # ========================================
         # Step 3: Homography変換
         # ========================================
@@ -101,14 +102,12 @@ class HomographicDataset:
         # image_b: (3, H, W) - 変換後の画像
         # valid_mask: (H, W) - 有効ピクセル (bool)
 
-
         return {
             'image_a': image,
             'image_b': image_b,
             'H_ab': H_ab,
             'valid_mask': valid_mask
         }
-
 
     def _generate_random_homography(
         self,
@@ -156,7 +155,6 @@ class HomographicDataset:
             [0,          0,         1]
         ], dtype=np.float32)
 
-
         # ========================================
         # 2. Scale
         # ========================================
@@ -167,7 +165,6 @@ class HomographicDataset:
             [0,     scale, 0],
             [0,     0,     1]
         ], dtype=np.float32)
-
 
         # ========================================
         # 3. Shear
@@ -181,7 +178,6 @@ class HomographicDataset:
             [0,       0,       1]
         ], dtype=np.float32)
 
-
         # ========================================
         # 4. Translation (画像中心基準)
         # ========================================
@@ -194,7 +190,6 @@ class HomographicDataset:
             [0, 0, 1]
         ], dtype=np.float32)
 
-
         # ========================================
         # 5. Perspective
         # ========================================
@@ -206,7 +201,6 @@ class HomographicDataset:
             [0,  1, 0],
             [p1, p2, 1]
         ], dtype=np.float32)
-
 
         # ========================================
         # 6. 合成 (画像中心を原点とする)
@@ -230,7 +224,6 @@ class HomographicDataset:
 
         return torch.from_numpy(H)
 
-
     def _warp_image(
         self,
         image: torch.Tensor,
@@ -249,12 +242,12 @@ class HomographicDataset:
         """
         import torch.nn.functional as F
 
-        C, H, W = image.shape
+        C, H_img, W_img = image.shape
 
         # グリッド生成
         y, x = torch.meshgrid(
-            torch.arange(H, dtype=torch.float32),
-            torch.arange(W, dtype=torch.float32),
+            torch.arange(H_img, dtype=torch.float32),
+            torch.arange(W_img, dtype=torch.float32),
             indexing='ij'
         )
 
@@ -272,8 +265,8 @@ class HomographicDataset:
 
         # Grid sample用に正規化 [-1, 1]
         coords_normalized = coords_warped.clone()
-        coords_normalized[..., 0] = 2.0 * coords_normalized[..., 0] / (W - 1) - 1.0
-        coords_normalized[..., 1] = 2.0 * coords_normalized[..., 1] / (H - 1) - 1.0
+        coords_normalized[..., 0] = 2.0 * coords_normalized[..., 0] / (W_img - 1) - 1.0
+        coords_normalized[..., 1] = 2.0 * coords_normalized[..., 1] / (H_img - 1) - 1.0
 
         # Grid sample
         warped = F.grid_sample(
@@ -286,25 +279,30 @@ class HomographicDataset:
         # 有効領域マスク
         valid_mask = (
             (coords_warped[..., 0] >= 0) &
-            (coords_warped[..., 0] < W) &
+            (coords_warped[..., 0] < W_img) &
             (coords_warped[..., 1] >= 0) &
-            (coords_warped[..., 1] < H)
+            (coords_warped[..., 1] < H_img)
         )
 
         return warped, valid_mask
 
-
     def _load_image(self, path: Path) -> torch.Tensor:
-        """画像読み込み (簡略版)"""
-        # 実装では PIL または cv2 使用
-        return torch.randn(3, 800, 800)  # Dummy
+        """画像読み込み（指定サイズにリサイズ）"""
+        from PIL import Image
+        import torchvision.transforms as T
 
+        image = Image.open(path).convert('RGB')
+        transform = T.Compose([
+            T.Resize(self.image_size),  # (H, W)
+            T.ToTensor()
+        ])
+        return transform(image)
 
 # ============================================
 # 2. Perspectiveデータセット (MegaDepth)
 # ============================================
 
-class MegaDepthDataset:
+class MegaDepthDataset(Dataset):
     """
     MegaDepthデータセット
 
@@ -351,6 +349,8 @@ class MegaDepthDataset:
         self.depth_paths = self.scene_info['depth_paths']
         self.pairs = self.scene_info['pairs']               # [(i, j), ...]
 
+    def __len__(self) -> int:
+        return len(self.pairs)
 
     def __getitem__(self, idx: int) -> Dict:
         """
@@ -379,7 +379,6 @@ class MegaDepthDataset:
         # ========================================
         idx_a, idx_b = self.pairs[idx]
 
-
         # ========================================
         # Step 2: 画像 & Depth読み込み
         # ========================================
@@ -388,7 +387,6 @@ class MegaDepthDataset:
 
         depth_a = self._load_depth(self.scene_dir / 'depths' / self.depth_paths[idx_a])
         # depth_a: (H, W) - メートル単位
-
 
         # ========================================
         # Step 3: カメラパラメータ取得
@@ -404,7 +402,6 @@ class MegaDepthDataset:
         # fx, fy: 焦点距離 (pixel)
         # cx, cy: 主点 (pixel)
 
-
         pose_a = torch.from_numpy(self.poses[idx_a]).float()  # (4, 4)
         pose_b = torch.from_numpy(self.poses[idx_b]).float()  # (4, 4)
 
@@ -414,7 +411,6 @@ class MegaDepthDataset:
         #
         # R: (3, 3) - 回転行列
         # t: (3, 1) - 並進ベクトル
-
 
         # ========================================
         # Step 4: 相対ポーズ計算
@@ -435,7 +431,6 @@ class MegaDepthDataset:
         R_ab = R_b @ R_a.T
         t_ab = t_b - R_ab @ t_a
 
-
         return {
             'image_a': image_a,
             'image_b': image_b,
@@ -446,16 +441,19 @@ class MegaDepthDataset:
             't_ab': t_ab
         }
 
-
     def _load_image(self, path: Path) -> torch.Tensor:
-        """画像読み込み (簡略版)"""
-        return torch.randn(3, 800, 800)  # Dummy
+        """画像読み込み"""
+        from PIL import Image
+        import torchvision.transforms as T
 
+        image = Image.open(path).convert('RGB')
+        transform = T.ToTensor()
+        return transform(image)
 
     def _load_depth(self, path: Path) -> torch.Tensor:
-        """Depthマップ読み込み (簡略版)"""
-        return torch.rand(800, 800) * 10.0  # Dummy (0-10m)
-
+        """Depthマップ読み込み"""
+        depth = np.load(path)
+        return torch.from_numpy(depth).float()
 
 # ============================================
 # 3. キーポイントのワープ (損失計算で使用)
@@ -499,7 +497,6 @@ def warp_keypoints_homography(
     kpts_warped = kpts_warped_homo[:, :2] / kpts_warped_homo[:, 2:3]
 
     return kpts_warped
-
 
 def warp_keypoints_perspective(
     keypoints: torch.Tensor,
@@ -560,13 +557,11 @@ def warp_keypoints_perspective(
         d
     ], dim=1)  # (N, 3)
 
-
     # ========================================
     # Step 2: Camera A → Camera B
     # ========================================
 
     P_b = (R_ab @ P_a.T).T + t_ab  # (N, 3)
-
 
     # ========================================
     # Step 3: 3D Point → Pixel (Image B)
@@ -583,7 +578,6 @@ def warp_keypoints_perspective(
     warped = torch.stack([x_b, y_b], dim=1)
 
     return warped
-
 
 # ============================================
 # 4. 使用例
@@ -614,7 +608,6 @@ def example_training_data():
     keypoints_b_warped = warp_keypoints_homography(keypoints_a, sample['H_ab'])
     print(f"\nKeypoints A: {keypoints_a[:3]}")
     print(f"Warped to B: {keypoints_b_warped[:3]}")
-
 
     print("\n" + "=" * 60)
     print("2. Perspectiveデータセット (MegaDepth)")
@@ -652,7 +645,6 @@ def example_training_data():
     )
     print(f"\nKeypoints A: {keypoints_a[:3]}")
     print(f"Warped to B: {keypoints_b_warped[:3]}")
-
 
 if __name__ == "__main__":
     example_training_data()

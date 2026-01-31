@@ -36,17 +36,41 @@ from typing import Dict, List, Tuple
 import argparse
 
 
+def mot_collate_fn(batch):
+    """
+    MOT用のカスタムcollate関数
+
+    バウンディングボックス数が可変なので、リストで返す
+    """
+    images_list = []
+    annotations_list = []
+
+    for images, annotations in batch:
+        images_list.append(images)
+        annotations_list.append(annotations)
+
+    # 画像はスタック可能（サイズが同じ）
+    images_batch = torch.stack(images_list, dim=0)  # (B, T, 3, H, W)
+
+    # アノテーションはリストのまま
+    # annotations_batch は List[List[Dict]] の形式
+    # 外側のリスト: バッチ次元
+    # 内側のリスト: フレーム次元
+
+    return images_batch, annotations_list
+
+
 class SimpleMOT17Dataset(Dataset):
     """
     MOT17の単一シーケンス用の簡易データセット
 
     【データフォーマット】
     gt.txt:
-    <frame>, <id>, <bb_left>, <bb_top>, <bb_width>, <bb_height>, <conf>, <x>, <y>, <z>
+    <frame>, <id>, <bb_left>, <bb_top>, <bb_width>, <bb_height>, <conf>, <class>, <visibility>
 
     例:
-    1,1,794,247,71,174,1,-1,-1,-1
-    1,2,1648,483,63,158,1,-1,-1,-1
+    1,1,912,484,97,109,0,7,1
+    2,1,912,484,97,109,0,7,1
     """
 
     def __init__(
@@ -131,7 +155,8 @@ class SimpleMOT17Dataset(Dataset):
 
     def __len__(self) -> int:
         # サンプル可能なシーケンス数
-        max_start = len(self.img_files) - self.sample_length * self.sample_interval
+        # sample_length+1フレーム必要なので、最後のフレームを考慮
+        max_start = len(self.img_files) - (self.sample_length + 1) * self.sample_interval
         return max(1, max_start // 10)  # 10フレームごとにサンプリング
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, List[Dict]]:
@@ -143,7 +168,8 @@ class SimpleMOT17Dataset(Dataset):
             annotations: List[Dict] - T+1個の要素
         """
         # ランダムな開始フレーム
-        max_start = len(self.img_files) - self.sample_length * self.sample_interval
+        # sample_length+1フレーム必要なので、最後のフレームを考慮
+        max_start = len(self.img_files) - (self.sample_length + 1) * self.sample_interval
         start_idx = random.randint(0, max(0, max_start))
 
         # sample_length+1フレームをサンプリング
@@ -161,6 +187,7 @@ class SimpleMOT17Dataset(Dataset):
 
             # 画像をロード
             img = Image.open(self.img_files[frame_idx]).convert('RGB')
+            orig_width, orig_height = img.size
 
             # リサイズ (簡略化: アスペクト比無視)
             img = img.resize((self.image_size[1], self.image_size[0]))
@@ -170,12 +197,26 @@ class SimpleMOT17Dataset(Dataset):
 
             images.append(img)
 
-            # アノテーションを取得
+            # アノテーションを取得して座標変換
             ann = self.annotations[frame_idx]
 
-            # バウンディングボックスを正規化 (簡略化)
-            # 実際はリサイズに応じて変換が必要
-            annotations.append(ann)
+            # バウンディングボックスをリサイズ後の座標に変換
+            scale_x = self.image_size[1] / orig_width
+            scale_y = self.image_size[0] / orig_height
+
+            if len(ann['bboxes']) > 0:
+                scaled_bboxes = ann['bboxes'].clone()
+                scaled_bboxes[:, 0] *= scale_x  # x
+                scaled_bboxes[:, 1] *= scale_y  # y
+                scaled_bboxes[:, 2] *= scale_x  # width
+                scaled_bboxes[:, 3] *= scale_y  # height
+            else:
+                scaled_bboxes = ann['bboxes']
+
+            annotations.append({
+                'ids': ann['ids'],
+                'bboxes': scaled_bboxes,
+            })
 
         images = torch.stack(images)  # (T+1, 3, H, W)
 
@@ -236,8 +277,9 @@ class SimpleMOTIP(nn.Module):
             nn.Linear(feature_dim, feature_dim),
         )
 
-        # ID埋め込み
-        self.id_embeddings = nn.Embedding(num_id_vocabulary + 1, feature_dim)
+        # ID埋め込み (nn.Linear + One-hot、実際のMOTIPと同じ実装)
+        # K+1個のスロット: 0~K-1がID用、Kが新規物体トークン
+        self.word_to_embed = nn.Linear(num_id_vocabulary + 1, feature_dim, bias=False)
 
         # ID Decoder (超簡易: 1層のみ)
         self.id_decoder = nn.TransformerDecoderLayer(
@@ -248,6 +290,29 @@ class SimpleMOTIP(nn.Module):
 
         # ID予測ヘッド
         self.id_head = nn.Linear(feature_dim * 2, num_id_vocabulary + 1)
+
+    def id_label_to_embed(self, id_labels: torch.Tensor) -> torch.Tensor:
+        """
+        ID ラベル (スロット番号) をOne-hot化してLinear変換
+        実際のMOTIPと同じ実装
+
+        Args:
+            id_labels: (...,) - スロット番号 [0~K-1: ID, K: 新規物体]
+
+        Returns:
+            id_embeds: (..., feature_dim) - ID埋め込み
+        """
+        # One-hot エンコーディング
+        one_hot = torch.eye(
+            self.num_id_vocabulary + 1,
+            dtype=self.word_to_embed.weight.dtype,
+            device=self.word_to_embed.weight.device
+        )[id_labels]  # (..., K+1)
+
+        # Linear 変換
+        id_embeds = self.word_to_embed(one_hot)  # (..., feature_dim)
+
+        return id_embeds
 
     def forward(
         self,
@@ -320,7 +385,7 @@ class SimpleMOTIP(nn.Module):
                 (B, T - 1, self.num_queries),
                 device=images.device
             )
-            historical_id_embed = self.id_embeddings(historical_ids)  # (B, T-1, N, 128)
+            historical_id_embed = self.id_label_to_embed(historical_ids)  # (B, T-1, N, 128)
 
             # 履歴軌跡トークン: τ^{m,km} = concat(f^m, i^km)
             historical_tokens = torch.cat([
@@ -335,7 +400,7 @@ class SimpleMOTIP(nn.Module):
             current_embed = all_embeds[:, -1]  # (B, N, 128)
 
             # 新規物体用の特別トークン i^spec を付与
-            spec_embed = self.id_embeddings(
+            spec_embed = self.id_label_to_embed(
                 torch.full((B, self.num_queries), self.num_id_vocabulary, device=images.device)
             )  # (B, N, 128)
 
@@ -352,8 +417,8 @@ class SimpleMOTIP(nn.Module):
             # Transformer Decoder
             # Query: 現在フレームの検出 (B, N, 256)
             # Memory: 履歴軌跡 (B, N, 256)
-            current_tokens_flat = current_tokens.view(B * self.num_queries, -1).unsqueeze(0)  # (1, B*N, 256)
-            memory_flat = memory.view(B * self.num_queries, -1).unsqueeze(0)  # (1, B*N, 256)
+            current_tokens_flat = current_tokens.reshape(B * self.num_queries, -1).unsqueeze(0)  # (1, B*N, 256)
+            memory_flat = memory.reshape(B * self.num_queries, -1).unsqueeze(0)  # (1, B*N, 256)
 
             id_output = self.id_decoder(
                 current_tokens_flat,
@@ -369,7 +434,7 @@ class SimpleMOTIP(nn.Module):
 
 def compute_loss(
     outputs: Dict[str, torch.Tensor],
-    annotations: List[Dict],
+    annotations: List[List[Dict]],
     device: torch.device,
 ) -> torch.Tensor:
     """
@@ -379,8 +444,10 @@ def compute_loss(
         outputs: モデル出力
             pred_logits: (B, T, N, 2) - クラス確率
             pred_boxes: (B, T, N, 4) - バウンディングボックス
-        annotations: Ground Truth
-            各要素は1フレームのアノテーション:
+        annotations: Ground Truth (List[List[Dict]])
+            外側のリスト: バッチ次元
+            内側のリスト: フレーム次元
+            各Dictの要素:
                 ids: (M,) - 物体ID
                 bboxes: (M, 4) - バウンディングボックス [x, y, w, h]
 
@@ -403,11 +470,10 @@ def compute_loss(
             frame_pred_boxes = pred_boxes[b, t]    # (N, 4)
 
             # 対応するGround Truth
-            ann_idx = b * T + t
-            if ann_idx >= len(annotations):
+            if b >= len(annotations) or t >= len(annotations[b]):
                 continue
 
-            gt = annotations[ann_idx]
+            gt = annotations[b][t]
             gt_bboxes = gt['bboxes'].to(device)  # (M, 4)
             M = gt_bboxes.shape[0]
 
@@ -539,6 +605,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=2,
+        collate_fn=mot_collate_fn,
     )
 
     # Model

@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple
 
-
 class ALIKEDLossWrapper(nn.Module):
     """
     ALIKED 損失計算ラッパー
@@ -48,7 +47,6 @@ class ALIKEDLossWrapper(nn.Module):
 
         self.tdes = tdes
         self.trel = trel
-
 
     def forward(
         self,
@@ -109,7 +107,10 @@ class ALIKEDLossWrapper(nn.Module):
         # ========================================
         # 4. Reliable Loss
         # ========================================
-        loss_re = self._reliable_loss(outputs_a, outputs_b)
+        loss_re = self._reliable_loss(
+            outputs_a, outputs_b,
+            homography_ab, depth_a, R_ab, t_ab
+        )
 
         # ========================================
         # Total Loss
@@ -128,7 +129,6 @@ class ALIKEDLossWrapper(nn.Module):
             'loss_re': loss_re,
             'total_loss': total_loss
         }
-
 
     def _reprojection_loss(
         self,
@@ -217,7 +217,6 @@ class ALIKEDLossWrapper(nn.Module):
         else:
             return torch.tensor(0.0, device=kpts_a.device)
 
-
     def _peaky_loss(
         self,
         outputs_a: Dict,
@@ -298,7 +297,6 @@ class ALIKEDLossWrapper(nn.Module):
         loss_b = compute_dispersity(score_map_b, kpts_b)
 
         return (loss_a + loss_b) / 2.0
-
 
     def _sparse_nre_loss(
         self,
@@ -409,25 +407,30 @@ class ALIKEDLossWrapper(nn.Module):
         else:
             return torch.tensor(0.0, device=kpts_a.device)
 
-
     def _reliable_loss(
         self,
         outputs_a: Dict,
-        outputs_b: Dict
+        outputs_b: Dict,
+        H_ab: torch.Tensor,
+        depth_a: torch.Tensor = None,
+        R_ab: torch.Tensor = None,
+        t_ab: torch.Tensor = None
     ) -> torch.Tensor:
         """
-        Reliable Loss
+        Reliable Loss (論文 Section V-D, 式12-13)
 
-        記述子の信頼性に基づいてスコアを調整:
-        - 記述子が他画像で明確にマッチする → 高信頼性 → 高スコア
-        - 記述子が曖昧 → 低信頼性 → 低スコア
+        マッチング対応点での記述子の信頼性に基づいてスコアを調整:
+        - 対応点の記述子が明確にマッチする → 高信頼性 → 高スコア維持
+        - 対応点の記述子が曖昧 → 低信頼性 → スコアを下げる
 
         数式:
-        r(pA, I_B) = softmax(sim(dA, D_B) / t_rel)
-        L_re = Σ (1 - r(pA, I_B)) * sA / Σ sA
+        r(pA, I_B) = softmax(sim(dA, D_B) / t_rel)[idx_b]  (式12, 対応点のindex)
+        L_re = (1 / ŜA) * Σ (1 - r(pA, I_B)) * sA           (式13)
 
         入力:
             outputs_a, outputs_b: キーポイント・記述子・スコア情報
+            H_ab: Homography行列
+            depth_a, R_ab, t_ab: Perspective projection用（オプション）
 
         出力:
             loss: scalar
@@ -437,6 +440,7 @@ class ALIKEDLossWrapper(nn.Module):
         desc_a = outputs_a['descriptors']    # (B, N_a, dim)
         scores_a = outputs_a['scores']       # (B, N_a)
 
+        kpts_b = outputs_b['keypoints']      # (B, N_b, 2)
         desc_b = outputs_b['descriptors']    # (B, N_b, dim)
 
         B = kpts_a.shape[0]
@@ -444,38 +448,56 @@ class ALIKEDLossWrapper(nn.Module):
         total_loss = 0.0
 
         for b in range(B):
-            DA = desc_a[b]  # (N_a, dim)
-            DB = desc_b[b]  # (N_b, dim)
             SA = scores_a[b]  # (N_a,)
+            DB = desc_b[b]    # (N_b, dim)
 
             # ========================================
-            # Reliability計算
+            # Step 1: 幾何的対応からマッチングペアを見つける
             # ========================================
+            kpts_a_warped = self._warp_keypoints(
+                kpts_a[b],
+                H_ab[b] if H_ab is not None else None,
+                depth_a[b] if depth_a is not None else None,
+                R_ab[b] if R_ab is not None else None,
+                t_ab[b] if t_ab is not None else None
+            )
 
-            # Similarity matrix
-            sim_matrix = torch.matmul(DA, DB.T)  # (N_a, N_b)
+            matches_ab = self._find_nearest_neighbors(
+                kpts_a_warped,
+                kpts_b[b],
+                distance_threshold=5.0
+            )
 
-            # Reliability: 最大類似度のsoftmax
-            reliability = F.softmax(sim_matrix / self.trel, dim=1)
-            # reliability: (N_a, N_b)
-
-            # 各キーポイントの最大信頼性
-            r_max, _ = reliability.max(dim=1)  # (N_a,)
+            if len(matches_ab) == 0:
+                continue
 
             # ========================================
-            # Loss計算
+            # Step 2: マッチングペアごとにReliability計算
             # ========================================
+            weighted_loss = 0.0
+            score_sum = 0.0
 
-            # スコアの正規化
-            sa_sum = SA.sum() + 1e-8
+            for idx_a, idx_b in matches_ab:
+                dA = desc_a[b, idx_a]   # (dim,)
+                sA = SA[idx_a]          # scalar
 
-            # 低信頼性のキーポイントに高スコアがあるとペナルティ
-            loss_b = ((1.0 - r_max) * SA).sum() / sa_sum
+                # Matching similarity vector (式9)
+                sim = torch.matmul(DB, dA)  # (N_b,)
 
-            total_loss += loss_b
+                # Reliability: 対応点でのsoftmax値 (式12)
+                r_vec = F.softmax(sim / self.trel, dim=0)  # (N_b,)
+                r = r_vec[idx_b]  # 対応点のreliability (scalar)
+
+                # 重み付きloss (式13)
+                weighted_loss += (1.0 - r) * sA
+                score_sum += sA
+
+            # 正規化 (式13: 1/ŜA)
+            if score_sum > 0:
+                loss_b = weighted_loss / (score_sum + 1e-8)
+                total_loss += loss_b
 
         return total_loss / B
-
 
     def _warp_keypoints(
         self,
@@ -519,7 +541,6 @@ class ALIKEDLossWrapper(nn.Module):
             # 実装では depth map と R, t を使用
             return keypoints  # 簡略化のため
 
-
     def _find_nearest_neighbors(
         self,
         kpts_src: torch.Tensor,
@@ -553,7 +574,6 @@ class ALIKEDLossWrapper(nn.Module):
                 matches.append((i, min_indices[i].item()))
 
         return matches
-
 
 # ============================================
 # 使用例
@@ -595,7 +615,6 @@ def example_loss():
     print("Losses:")
     for k, v in losses.items():
         print(f"  {k}: {v.item():.4f}")
-
 
 if __name__ == "__main__":
     example_loss()

@@ -14,7 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-
 class ConvBlock(nn.Module):
     """
     基本畳み込みブロック
@@ -46,7 +45,6 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
-
 
 class ResBlock(nn.Module):
     """
@@ -94,7 +92,6 @@ class ResBlock(nn.Module):
         out = F.selu(out)
 
         return out
-
 
 class DeformableConv2d(nn.Module):
     """
@@ -182,7 +179,6 @@ class DeformableConv2d(nn.Module):
 
         return x  # 簡略化のため元の特徴を返す
 
-
 class SDDH(nn.Module):
     """
     Sparse Deformable Descriptor Head (SDDH)
@@ -234,7 +230,6 @@ class SDDH(nn.Module):
             nn.Conv2d(in_dim, 2 * M, kernel_size=1)
         )
 
-
         # ========================================
         # 特徴エンコーダー
         # ========================================
@@ -244,7 +239,6 @@ class SDDH(nn.Module):
             nn.Conv2d(in_dim, out_dim, kernel_size=1),
             nn.SELU()
         )
-
 
         # ========================================
         # 記述子集約
@@ -256,7 +250,6 @@ class SDDH(nn.Module):
 
         # または Conv1x1ベースの集約
         self.agg_conv = nn.Conv2d(out_dim, out_dim, kernel_size=1)
-
 
     def forward(
         self,
@@ -285,7 +278,6 @@ class SDDH(nn.Module):
         patches = self._extract_patches(features, keypoints, self.K)
         # patches: (B*N, in_dim, K, K)
 
-
         # ========================================
         # Step 2: Deformableサンプル位置推定
         # ========================================
@@ -299,7 +291,6 @@ class SDDH(nn.Module):
         # オフセットをクランプ (極端な変位を防止)
         max_offset = max(H, W) / 4
         offsets = torch.clamp(offsets, -max_offset, max_offset)
-
 
         # ========================================
         # Step 3: Deformable Sampling
@@ -317,7 +308,6 @@ class SDDH(nn.Module):
         )
         # sampled_features: (B, N, M, in_dim)
 
-
         # ========================================
         # Step 4: 特徴エンコーディング
         # ========================================
@@ -334,7 +324,6 @@ class SDDH(nn.Module):
         encoded = encoded.view(B, N, self.M, self.out_dim)
         # encoded: (B, N, M, out_dim)
 
-
         # ========================================
         # Step 5: 記述子集約
         # ========================================
@@ -350,7 +339,6 @@ class SDDH(nn.Module):
         descriptors = F.normalize(descriptors, p=2, dim=-1)
 
         return descriptors
-
 
     def _extract_patches(
         self,
@@ -416,7 +404,6 @@ class SDDH(nn.Module):
 
         return patches
 
-
     def _sample_features(
         self,
         features: torch.Tensor,
@@ -462,7 +449,6 @@ class SDDH(nn.Module):
 
         return sampled
 
-
 # ============================================
 # 使用例
 # ============================================
@@ -499,7 +485,6 @@ def example_sddh():
     print(f"  Operations: N × M × C = 500 × 16 × 128 = 1.0M")
     print(f"  Memory: N × C = 500 × 128 = 64KB")
     print(f"  Speedup: ~300x faster!")
-
 
 if __name__ == "__main__":
     example_sddh()
