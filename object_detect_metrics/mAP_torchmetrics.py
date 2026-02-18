@@ -28,6 +28,25 @@ def evaluate_map(
 
     Returns:
         float: Mean Average Precision (mAP) over all classes and IoU thresholds.
+
+    Notes on `metrics` returned by map_metric.compute():
+        - metrics['map']         : mAP averaged over all IoUs, classes, and maxDet thresholds.
+        - metrics['precision']   : Tensor of shape [T, R, K, A, M]
+            T = number of IoU thresholds
+            R = number of recall sampling points (101 by default)
+            K = number of classes
+            A = number of area categories (usually 1: all)
+            M = number of max detection thresholds (usually 3: [1, 10, 100])
+        - metrics['recall']      : Tensor of shape [T, K, A, M], giving maximum recall achieved
+                                  for each IoU, class, area, and maxDet.
+        - Each element in metrics['precision'] corresponds to the **interpolated precision
+          at a specific recall point**, following COCO-style "upper-envelope" interpolation:
+            precision[r] = max precision for recall >= r
+          → Therefore, these values are **optimistic** compared to precision computed
+            directly from TP/FP counts at a fixed confidence threshold.
+        - The 101 recall points are sampled uniformly from 0.0 to 1.0.
+        - maxDet specifies the number of top predictions per image considered, COCO-specific.
+        - Note: metrics['precision'] does **not** correspond to precision at a fixed confidence threshold.
     """
     n_images = len(preds_boxes)
     assert all(len(lst) == n_images for lst in [preds_scores, preds_labels, gt_boxes, gt_labels]), \
@@ -54,13 +73,26 @@ def evaluate_map(
     else:
         map_metric = MeanAveragePrecision()  # defaults to COCO-style 0.5:0.95
 
-    # Update metric
+    # Update metric with predictions and ground truths
     map_metric.update(preds_tm, gts_tm)
 
-    # Compute final mAP
+    # Compute final metrics
     metrics = map_metric.compute()
-    return metrics['map'].item()
+    
+    # ---- metrics explanation ----
+    # metrics['map']      : float, mAP averaged over all IoUs, classes, and maxDet thresholds
+    # metrics['precision']: Tensor[T, R, K, A, M]
+    #     T = number of IoU thresholds
+    #     R = number of recall sampling points (default 101)
+    #     K = number of classes
+    #     A = number of area categories (usually 1)
+    #     M = number of max detection thresholds (usually 3: [1,10,100])
+    #     Values are **COCO-style interpolated precision**, i.e., optimistic compared
+    #     to precision computed from fixed confidence thresholds (upper-envelope interpolation)
+    # metrics['recall']   : Tensor[T, K, A, M], max recall for each IoU, class, area, and maxDet
+    # Note: metrics['precision'] does NOT give exact precision at a fixed confidence threshold.
 
+    return metrics['map'].item()
 
 # 2画像の例
 preds_boxes = [np.array([[10, 20, 50, 60], [15, 25, 55, 65]]),
