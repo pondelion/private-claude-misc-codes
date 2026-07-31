@@ -76,6 +76,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
+from tqdm.auto import tqdm
 
 
 # ============================================================
@@ -419,6 +420,28 @@ class InternVL35Collator:
 # モデルのロード & LoRA 適用
 # ============================================================
 
+def _find_submodule(model, attr_names):
+    """
+    モデルから指定属性名のサブモジュールを探す (深さ 1 および 2 に対応)。
+
+    trust_remote_code 版 (InternVLChatModel):
+        model.language_model, model.mlp1, model.vision_model  ← 深さ 1
+    HF ネイティブ版 (InternVLForConditionalGeneration):
+        model.model.language_model, model.model.multi_modal_projector ← 深さ 2
+
+    返値: (parent_module, attr_name) または (None, None)
+    """
+    for a in attr_names:
+        if hasattr(model, a):
+            return model, a
+    # 深さ 2: model.model.*
+    inner = getattr(model, 'model', None)
+    if inner is not None:
+        for a in attr_names:
+            if hasattr(inner, a):
+                return inner, a
+    return None, None
+
 def load_model_for_finetuning(
     model_path: str,
     use_lora: bool = True,
@@ -428,6 +451,7 @@ def load_model_for_finetuning(
     freeze_vit: bool = True,
     dtype: torch.dtype = torch.bfloat16,
     device_map: str = 'auto',
+    quantization: Optional[str] = None,
 ):
     """
     InternVL3.5 モデルとトークナイザーをロードして学習用に設定する。
@@ -442,6 +466,7 @@ def load_model_for_finetuning(
       freeze_vit   : bool ViT を凍結するか (通常 True)
       dtype        : torch.dtype (デフォルト bfloat16)
       device_map   : str  'auto' で複数GPU自動分散
+      quantization : str | None  '4bit' / '8bit' / None (QLoRA 用)
 
     返値:
       model      : InternVLChatModel  学習準備済みモデル
@@ -461,30 +486,138 @@ def load_model_for_finetuning(
     IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     print(f"  IMG_CONTEXT_TOKEN ID: {IMG_CONTEXT_ID}")
 
-    # モデルをロード
-    model = AutoModel.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-    )
-    model.img_context_token_id = IMG_CONTEXT_ID
+    # 量子化設定 (QLoRA)
+    _bnb_cfg = None
+    if quantization is not None:
+        from transformers import BitsAndBytesConfig
+        if quantization == '4bit':
+            _bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4',
+            )
+        elif quantization == '8bit':
+            _bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            raise ValueError(f"quantization は '4bit' / '8bit' / None のみ有効: {quantization!r}")
+        print(f"  量子化: {quantization} (QLoRA)")
 
-    # ViT を凍結
+    # モデルをロード
+    # ----------------------------------------------------------------
+    # ロード戦略 (優先順位順):
+    #
+    # [1] HF ネイティブ LM ヘッド付きクラス (InternVLForConditionalGeneration など)
+    #     → -HF 版に対応。outputs.loss / logits が得られる
+    #       InternVLConfig は AutoModelForCausalLM に登録されていないため
+    #       直接クラスをインポートして試みる
+    #
+    # [2] AutoModel + trust_remote_code=True
+    #     → 非-HF 版 (InternVLChatModel) に対応。outputs.loss が得られる
+    #       -HF 版でこれを使うと InternVLModel (LM ヘッドなし) がロードされ
+    #       loss も logits も返らないため fine-tune 不可
+    # ----------------------------------------------------------------
+    import transformers as _tf
+
+    _HF_NATIVE_CLASSES = ('InternVLForConditionalGeneration', 'InternVLForCausalLM')
+    _model = None
+    _is_hf_native = False
+
+    for _cls_name in _HF_NATIVE_CLASSES:
+        # transformers のトップレベル or submodule から探す
+        _cls = getattr(_tf, _cls_name, None)
+        if _cls is None:
+            try:
+                from transformers.models.internvl import modeling_internvl as _m
+                _cls = getattr(_m, _cls_name, None)
+            except Exception:
+                pass
+        if _cls is None:
+            continue
+        try:
+            _model = _cls.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                device_map=device_map,
+                quantization_config=_bnb_cfg,
+            )
+            _is_hf_native = True
+            print(f"  (HF ネイティブ {_cls_name}: {type(_model).__name__})")
+            break
+        except Exception as _e:
+            print(f"  {_cls_name} 失敗: {type(_e).__name__}: {_e}")
+
+    if _model is None:
+        # フォールバック: trust_remote_code (非-HF 版の InternVLChatModel など)
+        _model = AutoModel.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=True,
+            quantization_config=_bnb_cfg,
+        )
+        _cls_name = type(_model).__name__
+        print(f"  (trust_remote_code: {_cls_name})")
+        # -HF モデルを trust_remote_code でロードすると InternVLModel になる
+        # → LM ヘッドがなく loss/logits が返らないため fine-tune 不可
+        if 'Chat' not in _cls_name and 'ForCausal' not in _cls_name and 'ForConditional' not in _cls_name:
+            print(f"\n  ⚠️  警告: {_cls_name} は LM ヘッドを持たないベースモデルです。")
+            print(f"     fine-tune には outputs.loss / logits が必要ですが、このクラスは返しません。")
+            print(f"     → 非-HF 版 (例: OpenGVLab/InternVL3_5-1B) の使用を推奨します。")
+
+    model = _model
+
+    # 量子化後処理: kbit 学習の準備 (LoRA 前に必須)
+    if quantization is not None:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        print("  prepare_model_for_kbit_training 完了")
+
+    # モデルにタイプフラグを付与 (forward / loss 抽出で参照)
+    model._is_hf_native = _is_hf_native
+    # img_context_token_id は trust_remote_code 版 (InternVLChatModel) のみ使用
+    if not _is_hf_native:
+        model.img_context_token_id = IMG_CONTEXT_ID
+
+    # ---- ViT を凍結 ----
+    # trust_remote_code 版 (InternVLChatModel): model.vision_model
+    # HF ネイティブ版 (InternVLModel):          model.vision_model が直接属性にない場合あり
+    _VIT_NAMES = ('vision_model', 'visual_encoder', 'vit', 'vision_tower', 'visual')
     if freeze_vit:
         print("  ViT を凍結中...")
-        for name, param in model.named_parameters():
-            if 'vision_model' in name:
-                param.requires_grad = False
-        vit_params = sum(p.numel() for p in model.vision_model.parameters())
+        _vit_module = next(
+            (getattr(model, a) for a in _VIT_NAMES if hasattr(model, a)),
+            None,
+        )
+        if _vit_module is not None:
+            _vit_module.requires_grad_(False)
+            vit_params = sum(p.numel() for p in _vit_module.parameters())
+        else:
+            # フォールバック: 名前パターンで凍結 (HF 版など直接属性がない場合)
+            vit_params = 0
+            for name, param in model.named_parameters():
+                if any(k in name for k in _VIT_NAMES):
+                    param.requires_grad = False
+                    vit_params += param.numel()
         print(f"  ViT パラメータ数 (凍結): {vit_params:,}")
 
-    # LoRA を適用
+    # ---- LoRA を適用 ----
     if use_lora:
         print(f"  LoRA を適用中 (r={lora_r}, alpha={lora_alpha})...")
 
-        # LLM のアーキテクチャに応じてターゲットモジュールを設定
-        llm_arch = model.config.llm_config.architectures[0]
+        # LLM のアーキテクチャを取得
+        # trust_remote_code 版: model.config.llm_config.architectures
+        # HF ネイティブ版:       model.config.text_config.architectures
+        _cfg = model.config
+        llm_arch = ''
+        for _sub in ('llm_config', 'text_config', 'language_config'):
+            _sub_cfg = getattr(_cfg, _sub, None)
+            if _sub_cfg is not None and hasattr(_sub_cfg, 'architectures'):
+                llm_arch = (_sub_cfg.architectures or [''])[0]
+                break
+        if not llm_arch:
+            llm_arch = (getattr(_cfg, 'architectures', None) or [''])[0]
+
         if llm_arch in ('Qwen2ForCausalLM', 'LlamaForCausalLM'):
             target_modules = [
                 'self_attn.q_proj', 'self_attn.k_proj',
@@ -503,23 +636,50 @@ def load_model_for_finetuning(
                 'gate_proj', 'down_proj', 'up_proj',
             ]
 
+        # LLM サブモジュールを探す
+        # trust_remote_code 版: model.language_model               (深さ 1)
+        # HF ネイティブ版:       model.model.language_model          (深さ 2)
+        _LLM_NAMES = ('language_model', 'llm', 'text_model', 'decoder')
+        _llm_parent, _llm_attr = _find_submodule(model, _LLM_NAMES)
+        if _llm_parent is None:
+            raise RuntimeError(
+                f"LLM サブモジュールが見つかりません。試行した属性: {_LLM_NAMES}\n"
+                f"model の属性一覧: {[n for n, _ in model.named_children()]}"
+            )
+        _llm_module = getattr(_llm_parent, _llm_attr)
+
+        # task_type=CAUSAL_LM は prepare_inputs_for_generation が必要。
+        # HF 版 Qwen3Model (ベースモデル) はそれを持たないため None にフォールバック。
+        _task_type = TaskType.CAUSAL_LM if hasattr(_llm_module, 'prepare_inputs_for_generation') else None
+
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             target_modules=target_modules,
             lora_dropout=lora_dropout,
             bias='none',
-            task_type=TaskType.CAUSAL_LM,
+            task_type=_task_type,
         )
-        model.language_model = get_peft_model(model.language_model, lora_config)
-        model.language_model.enable_input_require_grads()
-        model.language_model.print_trainable_parameters()
+        if _task_type is None:
+            print(f"  (task_type=None: {type(_llm_module).__name__} は CausalLM ではなくベースモデル)")
 
-    # MLP Projector は常に学習可能
-    for param in model.mlp1.parameters():
-        param.requires_grad = True
-    mlp_params = sum(p.numel() for p in model.mlp1.parameters() if p.requires_grad)
-    print(f"  MLP Projector 学習可能パラメータ: {mlp_params:,}")
+        _llm_module = get_peft_model(_llm_module, lora_config)
+        _llm_module.enable_input_require_grads()
+        _llm_module.print_trainable_parameters()
+        setattr(_llm_parent, _llm_attr, _llm_module)
+
+    # ---- MLP Projector は常に学習可能 ----
+    # trust_remote_code 版: model.mlp1                         (深さ 1)
+    # HF ネイティブ版:       model.model.multi_modal_projector  (深さ 2)
+    _MLP_NAMES = ('mlp1', 'multi_modal_projector', 'projector', 'connector', 'vision_proj')
+    _mlp_parent, _mlp_attr = _find_submodule(model, _MLP_NAMES)
+    if _mlp_parent is not None:
+        _mlp_mod = getattr(_mlp_parent, _mlp_attr)
+        _mlp_mod.requires_grad_(True)
+        mlp_params = sum(p.numel() for p in _mlp_mod.parameters() if p.requires_grad)
+        print(f"  MLP Projector ({_mlp_attr}) 学習可能パラメータ: {mlp_params:,}")
+    else:
+        print("  MLP Projector: 対応属性が見つかりません (スキップ)")
 
     # 総学習可能パラメータ
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -537,6 +697,7 @@ def train(
     tokenizer,
     train_df: pd.DataFrame,
     eval_df: Optional[pd.DataFrame] = None,
+    log_preview_df: Optional[pd.DataFrame] = None,
     output_dir: str = './internvl35-finetuned',
     epochs: int = 3,
     batch_size: int = 1,
@@ -549,7 +710,10 @@ def train(
     max_tiles: int = 6,
     num_image_token: int = 256,
     save_every_n_steps: int = 500,
+    save_checkpoint: bool = False,
     eval_every_n_steps: int = 200,
+    log_steps: int = 10,
+    max_grad_norm: float = 1.0,
     fp16: bool = False,
     bf16: bool = True,
 ) -> None:
@@ -557,33 +721,37 @@ def train(
     InternVL3.5 のファインチューニング学習ループ。
 
     引数:
-      model        : load_model_for_finetuning でロードしたモデル
-      tokenizer    : 対応するトークナイザー
-      train_df     : pd.DataFrame  学習データ
-                     必須カラム: image, question, answer
-      eval_df      : pd.DataFrame  評価データ (省略可)
-      output_dir   : str  チェックポイント保存先
-      epochs       : int  エポック数
-      batch_size   : int  ミニバッチサイズ (GPUメモリに応じて調整)
-      grad_acc     : int  勾配累積ステップ数
-                     実効バッチ = batch_size × grad_acc
-      lr           : float  学習率
-      weight_decay : float  AdamW 重み減衰
-      warmup_ratio : float  ウォームアップ比率 (全ステップ数に対する比)
-      max_seq_len  : int  最大系列長
-      num_workers  : int  DataLoader のワーカー数
-      max_tiles    : int  画像の最大タイル数 (通常 6)
-      num_image_token: int  1パッチあたりの IMG_CONTEXT 数 (通常 256)
-      save_every_n_steps: int  チェックポイント保存間隔
-      eval_every_n_steps: int  評価実行間隔
-      fp16         : bool  FP16 混合精度 (V100等)
-      bf16         : bool  BF16 混合精度 (A100/H100等, 推奨)
+      model            : load_model_for_finetuning でロードしたモデル
+      tokenizer        : 対応するトークナイザー
+      train_df         : pd.DataFrame  学習データ (image, question, answer 必須)
+      eval_df          : pd.DataFrame  評価データ (省略可)
+      log_preview_df   : pd.DataFrame  log_steps ごとに generate 表示する固定サンプル
+                         (None の場合スキップ。eval_df から事前に数件サンプリングして渡す)
+                             log_preview_df = eval_df.sample(n=2, random_state=42)
+      output_dir       : str  チェックポイント保存先
+      epochs           : int  エポック数
+      batch_size       : int  ミニバッチサイズ
+      grad_acc         : int  勾配累積ステップ数 (実効バッチ = batch_size × grad_acc)
+      lr               : float  学習率
+      weight_decay     : float  AdamW 重み減衰
+      warmup_ratio     : float  ウォームアップ比率
+      max_seq_len      : int  最大系列長
+      num_workers      : int  DataLoader ワーカー数
+      max_tiles        : int  最大タイル数
+      num_image_token  : int  1パッチあたりの IMG_CONTEXT 数
+      save_every_n_steps: int  チェックポイント保存間隔 (optimizer step 単位)
+      eval_every_n_steps: int  中間評価間隔 (optimizer step 単位)
+      log_steps        : int  ロス表示 + 生成プレビュー間隔 (optimizer step 単位)
+      max_grad_norm    : float  勾配クリッピング閾値
+      fp16             : bool  FP16 混合精度
+      bf16             : bool  BF16 混合精度 (A100/H100 推奨)
     """
+
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- デバイス設定 ----
     device = next(model.parameters()).device
-    print(f"  学習デバイス: {device}")
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     # ---- データセット & DataLoader ----
     pad_id = tokenizer.pad_token_id or 0
@@ -625,9 +793,8 @@ def train(
         )
 
     # ---- オプティマイザー ----
-    # ViT はすでに凍結されているので model.parameters() で学習可能パラメータのみ
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        trainable_params,
         lr=lr,
         weight_decay=weight_decay,
         betas=(0.9, 0.95),
@@ -637,10 +804,8 @@ def train(
     # ---- スケジューラー (コサインアニーリング + ウォームアップ) ----
     total_steps = len(train_loader) // grad_acc * epochs
     warmup_steps = int(total_steps * warmup_ratio)
-    print(f"  総ステップ数: {total_steps}, ウォームアップ: {warmup_steps}")
 
     def lr_lambda(current_step: int) -> float:
-        """ウォームアップ + コサインアニーリング スケジュール。"""
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
@@ -649,24 +814,42 @@ def train(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # ---- 混合精度スケーラー ----
-    scaler = torch.cuda.amp.GradScaler() if (fp16 and not bf16) else None
     amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else None)
+    scaler = torch.cuda.amp.GradScaler() if (fp16 and not bf16) else None
+
+    # ---- 設定サマリー ----
+    precision_name = {torch.bfloat16: "bfloat16", torch.float16: "float16"}.get(amp_dtype, "float32")
+    print(f"\n訓練設定:")
+    print(f"  サンプル数:          train={len(train_dataset)}, eval={len(eval_df) if eval_df is not None else 0}")
+    print(f"  バッチサイズ:        {batch_size}  (実効: {batch_size * grad_acc})")
+    print(f"  エポック数:          {epochs}")
+    print(f"  総ステップ数:        {total_steps}  (warmup: {warmup_steps})")
+    print(f"  学習率:              {lr}")
+    print(f"  Precision:           {precision_name}")
+    print(f"  訓練可能パラメータ:  {sum(p.numel() for p in trainable_params):,}")
+    print(f"  デバイス:            {device}")
+    print("-" * 60)
+
+    # ---- 初期評価 ----
+    optimizer_step = 0
+    if eval_loader is not None:
+        init_eval = evaluate(model, eval_loader, device, amp_dtype, bf16)
+        print(f"初期評価  loss: {init_eval['loss']:.4f}")
+    if log_preview_df is not None:
+        log_sample_predictions(model, tokenizer, log_preview_df, device, optimizer_step,
+                                amp_dtype=amp_dtype, bf16=bf16)
 
     # ---- 学習ループ ----
     global_step = 0
-    optimizer_step = 0
     running_loss = 0.0
     model.train()
-
-    print(f"\n学習開始: {epochs}エポック, 実効バッチ={batch_size * grad_acc}")
-    print(f"  train: {len(train_dataset)}サンプル / eval: {len(eval_dataset) if eval_df is not None else 0}サンプル")
-    print("-" * 60)
 
     for epoch in range(epochs):
         print(f"\n=== Epoch {epoch + 1}/{epochs} ===")
         model.train()
 
-        for step, batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", dynamic_ncols=True)
+        for batch in pbar:
             # バッチをデバイスに転送
             pixel_values   = batch['pixel_values'].to(device, dtype=torch.bfloat16 if bf16 else torch.float32)
             input_ids      = batch['input_ids'].to(device)
@@ -675,29 +858,12 @@ def train(
             image_flags    = batch['image_flags'].to(device)
             loss_weight    = batch['loss_weight'].to(device, dtype=torch.float32)
 
-            # フォワードパス & 損失計算
-            ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if amp_dtype else torch.no_grad.__class__()
-            if amp_dtype:
-                with torch.cuda.amp.autocast(dtype=amp_dtype):
-                    outputs = model(
-                        pixel_values=pixel_values,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        image_flags=image_flags,
-                        labels=labels,
-                        loss_weight=loss_weight.tolist(),
-                    )
-                    loss = outputs.loss / grad_acc
-            else:
-                outputs = model(
-                    pixel_values=pixel_values,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    image_flags=image_flags,
-                    labels=labels,
-                    loss_weight=loss_weight.tolist(),
-                )
-                loss = outputs.loss / grad_acc
+            # フォワードパス
+            outputs = _model_forward(
+                model, pixel_values, input_ids, attention_mask, image_flags,
+                labels, loss_weight, amp_dtype=amp_dtype, bf16=bf16,
+            )
+            loss = _extract_loss(outputs, labels) / grad_acc
 
             running_loss += loss.item() * grad_acc
 
@@ -710,18 +876,18 @@ def train(
             global_step += 1
 
             # 勾配累積: grad_acc ステップごとに更新
-            if global_step % grad_acc == 0:
+            is_update_step = (
+                global_step % grad_acc == 0
+                or global_step == len(train_loader)
+            )
+            if is_update_step:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad], max_norm=1.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad], max_norm=1.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
                     optimizer.step()
 
                 scheduler.step()
@@ -732,31 +898,120 @@ def train(
                 running_loss = 0.0
                 current_lr = scheduler.get_last_lr()[0]
 
-                if optimizer_step % 10 == 0:
-                    print(f"  [Epoch {epoch+1}, Step {optimizer_step}] "
-                          f"loss={avg_loss:.4f}, lr={current_lr:.2e}")
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{current_lr:.2e}",
+                                 step=optimizer_step)
 
-                # ---- 評価 ----
+                # ---- ロギング + 生成プレビュー ----
+                if optimizer_step % log_steps == 0:
+                    print(f"  [Step {optimizer_step}/{total_steps}] "
+                          f"loss={avg_loss:.4f}, lr={current_lr:.2e}")
+                    if log_preview_df is not None:
+                        log_sample_predictions(model, tokenizer, log_preview_df, device,
+                                               optimizer_step, amp_dtype=amp_dtype, bf16=bf16,
+                                               display_image=False)
+
+                # ---- 中間評価 ----
                 if eval_loader is not None and optimizer_step % eval_every_n_steps == 0:
-                    eval_loss = evaluate(model, eval_loader, device, amp_dtype, bf16)
-                    print(f"  [Eval Step {optimizer_step}] eval_loss={eval_loss:.4f}")
+                    eval_result = evaluate(model, eval_loader, device, amp_dtype, bf16)
+                    print(f"  [Eval Step {optimizer_step}] eval_loss={eval_result['loss']:.4f}")
                     model.train()
 
                 # ---- チェックポイント保存 ----
-                if optimizer_step % save_every_n_steps == 0:
+                if save_checkpoint and optimizer_step % save_every_n_steps == 0:
                     ckpt_path = os.path.join(output_dir, f'checkpoint-{optimizer_step}')
                     save_model(model, tokenizer, ckpt_path)
                     print(f"  チェックポイント保存: {ckpt_path}")
 
+        # ---- エポック末評価 ----
+        if eval_loader is not None:
+            epoch_eval = evaluate(model, eval_loader, device, amp_dtype, bf16)
+            print(f"  Epoch {epoch + 1} 評価 loss: {epoch_eval['loss']:.4f}")
+
     # ---- 最終モデル保存 ----
-    final_path = os.path.join(output_dir, 'final')
-    save_model(model, tokenizer, final_path)
-    print(f"\n学習完了。最終モデル保存: {final_path}")
+    if save_checkpoint:
+        final_path = os.path.join(output_dir, 'final')
+        save_model(model, tokenizer, final_path)
+        print(f"\n学習完了。最終モデル保存: {final_path}")
 
 
 # ============================================================
 # 評価
 # ============================================================
+
+def _model_forward(model, pixel_values, input_ids, attention_mask, image_flags,
+                   labels, loss_weight, amp_dtype, bf16):
+    """
+    trust_remote_code 版と HF ネイティブ版で forward の kwargs が異なるため吸収する。
+
+    InternVLChatModel (trust_remote_code, 非-HF 版):
+        image_flags, loss_weight を受け付ける独自 forward → outputs.loss あり
+
+    InternVLForConditionalGeneration など (HF ネイティブ):
+        pixel_values / input_ids / attention_mask / labels のみ
+        image_flags・loss_weight は不要 (渡すと TypeError)
+        → outputs.loss および outputs.logits あり
+
+    InternVLModel (HF ネイティブ, ベースクラス):
+        loss も logits も返さない → fine-tune 不可
+    """
+    is_hf = getattr(model, '_is_hf_native', False)
+    ctx = torch.amp.autocast('cuda', dtype=amp_dtype) if (amp_dtype and torch.cuda.is_available()) else _null_ctx()
+
+    with ctx:
+        if is_hf:
+            # HF ネイティブ系: image_flags / loss_weight は渡さない
+            outputs = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+        else:
+            # trust_remote_code (InternVLChatModel): image_flags / loss_weight が必要
+            outputs = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                image_flags=image_flags,
+                labels=labels,
+                loss_weight=loss_weight.tolist() if loss_weight is not None else None,
+            )
+    return outputs
+
+
+def _extract_loss(outputs, labels):
+    """
+    outputs から loss を取り出す。loss 属性がない場合は logits から手動計算する。
+
+    trust_remote_code 版: outputs.loss が直接得られる
+    HF ネイティブ版:      outputs.loss があれば使用、なければ logits から CE 損失を計算
+    """
+    loss = getattr(outputs, 'loss', None)
+    if loss is not None:
+        return loss
+
+    logits = getattr(outputs, 'logits', None)
+    if logits is not None:
+        import torch.nn.functional as F
+        # logits: (B, L, V) → (B*L, V)
+        # labels: (B, L)    → (B*L,)
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1).to(logits.device),
+            ignore_index=IGNORE_INDEX,
+        )
+
+    raise RuntimeError(
+        f"損失計算不可: {type(outputs).__name__} に 'loss' も 'logits' もありません。\n"
+        f"AutoModelForCausalLM でロードされているか確認してください。"
+    )
+
+
+class _null_ctx:
+    """torch.autocast の代わりに使う no-op コンテキストマネージャ"""
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+
 
 @torch.no_grad()
 def evaluate(
@@ -782,36 +1037,220 @@ def evaluate(
     total_loss = 0.0
     n_batches = 0
 
-    for batch in eval_loader:
+    for batch in tqdm(eval_loader):
         pixel_values   = batch['pixel_values'].to(device, dtype=torch.bfloat16 if bf16 else torch.float32)
         input_ids      = batch['input_ids'].to(device)
         labels         = batch['labels'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         image_flags    = batch['image_flags'].to(device)
 
-        if amp_dtype:
-            with torch.cuda.amp.autocast(dtype=amp_dtype):
-                outputs = model(
-                    pixel_values=pixel_values,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    image_flags=image_flags,
-                    labels=labels,
-                )
-        else:
-            outputs = model(
+        outputs = _model_forward(
+            model, pixel_values, input_ids, attention_mask, image_flags,
+            labels, loss_weight=None, amp_dtype=amp_dtype, bf16=bf16,
+        )
+        loss = _extract_loss(outputs, labels)
+        total_loss += loss.item()
+        n_batches += 1
+
+    return {"loss": total_loss / max(n_batches, 1)}
+
+
+# ============================================================
+# 単一サンプル推論
+# ============================================================
+
+def generate_response(
+    model,
+    tokenizer,
+    image_path: Optional[str] = None,
+    question: str = "",
+    max_new_tokens: int = 512,
+    device: Optional[torch.device] = None,
+    bf16: bool = True,
+) -> str:
+    """
+    単一サンプルの推論 (ロギング用)
+
+    ========================================
+    Shape
+    ========================================
+    入力:
+        image_path: str (画像パス)
+        question:   str (質問テキスト, <image> タグ含んでもよい)
+
+    内部:
+        pixel_values : (N_tiles, 3, 448, 448)  タイル画像
+        input_ids    : (1, T_seq)               テキストトークン列
+        output_ids   : (1, T_seq + T_gen)       生成トークン列
+
+    出力:
+        response : str  生成テキスト
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    # ---- 画像の前処理 ----
+    pixel_values = None
+    num_patches_list = None
+    if image_path and Path(image_path).exists():
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(image_path).convert("RGB")
+        tiles = dynamic_preprocess(pil_img, tile_size=448, max_tiles=6, use_thumbnail=True)
+        # tiles: List[PIL.Image]  各タイルを前処理してスタック
+        pixel_values = torch.stack([preprocess_tile(t) for t in tiles])
+        # pixel_values: (N_tiles, 3, 448, 448)
+        pixel_values = pixel_values.to(device, dtype=torch.bfloat16 if bf16 else torch.float32)
+        num_patches_list = [len(tiles)]
+
+    # ---- テキストプロンプト構築 ----
+    # <image> タグが含まれていない場合は先頭に付加
+    if pixel_values is not None and "<image>" not in question:
+        question = "<image>\n" + question
+
+    model.eval()
+    with torch.no_grad():
+        if hasattr(model, 'chat'):
+            # trust_remote_code 版 (InternVLChatModel): model.chat() が利用可能
+            response = model.chat(
+                tokenizer=tokenizer,
                 pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                image_flags=image_flags,
-                labels=labels,
+                question=question,
+                generation_config=dict(
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                ),
+                num_patches_list=num_patches_list,
+                history=None,
+                return_history=False,
+            )
+        else:
+            # HF ネイティブ版: 学習時と同じチャットテンプレートでプロンプトを構築する
+            # 素のテキストを渡すと <|im_start|>assistant\n が欠けてループ生成になる
+            DEFAULT_SYSTEM = (
+                "You are InternVL3.5, created by Shanghai AI Laboratory. "
+                "You are a helpful assistant."
+            )
+            if pixel_values is not None:
+                n_tiles = pixel_values.shape[0]  # (N_tiles, 3, 448, 448)
+                img_context = IMG_CONTEXT_TOKEN * (256 * n_tiles)
+                img_tag = f'{IMG_START_TOKEN}{img_context}{IMG_END_TOKEN}'
+                user_content = question.replace('<image>', img_tag) if '<image>' in question else img_tag + '\n' + question
+            else:
+                user_content = question
+
+            prompt = (
+                f'<|im_start|>system\n{DEFAULT_SYSTEM}<|im_end|>\n'
+                f'<|im_start|>user\n{user_content}<|im_end|>\n'
+                f'<|im_start|>assistant\n'
             )
 
-        if outputs.loss is not None:
-            total_loss += outputs.loss.item()
-            n_batches += 1
+            inputs = tokenizer(prompt, return_tensors='pt', add_special_tokens=False).to(device)
+            # input_ids: (1, T_seq)
+            if pixel_values is not None:
+                inputs['pixel_values'] = pixel_values
+                # pixel_values: (N_tiles, 3, 448, 448)  ← バッチ次元は不要
 
-    return total_loss / max(n_batches, 1)
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+            # output_ids: (1, T_seq + T_gen)
+            input_len = inputs['input_ids'].shape[1]
+            response = tokenizer.decode(
+                output_ids[0, input_len:], skip_special_tokens=True
+            )
+
+    return response
+
+
+# ============================================================
+# 学習中サンプル生成表示
+# ============================================================
+
+def log_sample_predictions(
+    model,
+    tokenizer,
+    sample_df: pd.DataFrame,
+    device: torch.device,
+    global_step: int,
+    max_new_tokens: int = 128,
+    display_size: tuple = (300, 200),
+    display_image: bool = True,
+    amp_dtype: Optional[torch.dtype] = None,
+    bf16: bool = True,
+):
+    """
+    log_steps ごとに val サンプルを generate して画像・質問・生成文を表示する。
+
+    呼び出し元で eval_df から固定サンプルを切り出して渡すことで、
+    ステップをまたいで同じサンプルに対する生成変化を追える。
+
+        # 呼び出し側での準備例
+        log_preview_df = eval_df.sample(n=2, random_state=42).reset_index(drop=True)
+        # log_steps ごとに
+        log_sample_predictions(model, tokenizer, log_preview_df, device, global_step)
+
+    DataFrame カラム:
+        image    : str  画像ファイルパス
+        question : str  質問テキスト
+        answer   : str  正解テキスト
+
+    引数:
+        sample_df     : 表示対象の固定サンプル DataFrame (呼び出し元で固定しておく)
+        global_step   : 現在のステップ数 (表示用ラベル)
+        max_new_tokens: 生成の最大トークン数 (ログ用なので短めでよい)
+        display_size  : Jupyter 表示時のリサイズ後サイズ (width, height)
+        amp_dtype     : 混合精度 dtype (generate_response には未使用、シグネチャ統一のため)
+        bf16          : BF16 を使うか
+    """
+    model.eval()
+
+    print(f"\n{'='*60}")
+    print(f"[Step {global_step}] val サンプル生成プレビュー")
+    print(f"{'='*60}")
+
+    for i, (_, row) in enumerate(sample_df.iterrows()):
+        image_path   = row.get("image", None)
+        question_raw = row.get("question", "")
+        ground_truth = row.get("answer", "")
+
+        # <image> タグを除いた表示用質問テキスト
+        question_display = question_raw.replace("<image>", "").strip()
+
+        print(f"\n--- サンプル {i + 1} ---")
+        print(f"質問: {question_display[:120]}{'...' if len(question_display) > 120 else ''}")
+        print(f"正解: {str(ground_truth)[:120]}{'...' if len(str(ground_truth)) > 120 else ''}")
+
+        # 画像表示 (Jupyter のみ、失敗時はパスを print してフォールバック)
+        if display_image and image_path and Path(str(image_path)).exists():
+            try:
+                from IPython.display import display as ipy_display
+                pil_img = Image.open(image_path).convert("RGB")
+                pil_img_small = pil_img.resize(display_size, Image.LANCZOS)
+                ipy_display(pil_img_small)
+            except Exception:
+                print(f"[画像: {image_path}]")
+
+        # generate して生成文を表示
+        try:
+            response = generate_response(
+                model=model,
+                tokenizer=tokenizer,
+                image_path=image_path if (image_path and Path(str(image_path)).exists()) else None,
+                question=question_raw,
+                max_new_tokens=max_new_tokens,
+                device=device,
+                bf16=bf16,
+            )
+            print(f"生成: {response[:200]}{'...' if len(response) > 200 else ''}")
+        except Exception as e:
+            print(f"生成エラー: {e}")
+
+    print(f"{'='*60}\n")
+    model.train()
 
 
 # ============================================================
@@ -830,21 +1269,160 @@ def save_model(model, tokenizer, output_dir: str) -> None:
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # LoRA モデルかどうか確認
     from peft import PeftModel
-    if isinstance(model.language_model, PeftModel):
+
+    # LLM サブモジュールを探す (trust_remote_code 版は深さ 1、HF 版は深さ 2)
+    _LLM_NAMES = ('language_model', 'llm', 'text_model', 'decoder')
+    _llm_parent, _llm_attr = _find_submodule(model, _LLM_NAMES)
+    _llm_module = getattr(_llm_parent, _llm_attr) if _llm_parent is not None else None
+
+    if _llm_module is not None and isinstance(_llm_module, PeftModel):
         # LoRA アダプターのみ保存 (サイズ小)
-        model.language_model.save_pretrained(output_dir)
+        _llm_module.save_pretrained(output_dir)
         print(f"    LoRA アダプター保存: {output_dir}")
         # MLP Projector の重みも保存
-        mlp_path = os.path.join(output_dir, 'mlp1.pt')
-        torch.save(model.mlp1.state_dict(), mlp_path)
-        print(f"    MLP Projector 保存: {mlp_path}")
+        _MLP_NAMES = ('mlp1', 'multi_modal_projector', 'projector', 'connector', 'vision_proj')
+        _mlp_parent2, _mlp_attr2 = _find_submodule(model, _MLP_NAMES)
+        if _mlp_parent2 is not None:
+            mlp_path = os.path.join(output_dir, 'mlp_projector.pt')
+            torch.save(getattr(_mlp_parent2, _mlp_attr2).state_dict(), mlp_path)
+            print(f"    MLP Projector ({_mlp_attr2}) 保存: {mlp_path}")
     else:
         # フルファインチューニングの場合: 全体を保存
         model.save_pretrained(output_dir)
 
     tokenizer.save_pretrained(output_dir)
+
+
+# ============================================================
+# ScienceQA データセット変換
+# ============================================================
+
+def convert_scienceqa_to_df(
+    hf_dataset,
+    image_save_dir: str,
+    split: str = "train",
+    skip_no_image: bool = True,
+) -> pd.DataFrame:
+    """
+    HuggingFace の ScienceQA データセットを InternVL35Dataset 用 DataFrame に変換する。
+
+    ========================================
+    入力
+    ========================================
+    hf_dataset:
+        load_dataset("derek-thomas/ScienceQA", split="train[:500]") の返り値
+        features:
+            image    : PIL.Image or None  (画像なしサンプルは None)
+            question : str               (問題文)
+            choices  : list[str]         (選択肢 例: ["cat", "dog", "fish"])
+            answer   : int               (正解の選択肢インデックス, 0始まり)
+            hint     : str or None       (ヒント文)
+            solution : str or None       (解説)
+
+    image_save_dir : str
+        PIL画像をJPEGとして保存するディレクトリ
+        (InternVL35Dataset は画像をファイルパスで受け取るため)
+
+    split : str
+        保存ファイル名のプレフィックス用 (例: "train", "validation", "test")
+
+    skip_no_image : bool
+        image=None のサンプル (テキストのみ問題) をスキップするか。
+        True にすると画像が必須の VLM ファインチューニングに適したデータになる。
+
+    ========================================
+    出力 DataFrame columns
+    ========================================
+    image    : str
+        保存した画像ファイルの絶対パス
+    question : str
+        "<image>\\nヒント: {hint}\\n{問題文}\\nA. ...\\nB. ..." 形式
+        ※ hint が空の場合は hint 行を省略
+        ※ <image> タグは InternVL35Dataset._build_prompt が img_tokens に置換する
+    answer   : str
+        "答えはAです。{正解テキスト}\\n{solution}" 形式
+        ※ solution が空の場合は solution 行を省略
+
+    ========================================
+    使用例
+    ========================================
+    from datasets import load_dataset
+
+    hf_ds = load_dataset("derek-thomas/ScienceQA", split="train[:500]")
+    train_df = convert_scienceqa_to_df(hf_ds, image_save_dir="./scienceqa_images")
+
+    hf_val = load_dataset("derek-thomas/ScienceQA", split="validation[:100]")
+    eval_df = convert_scienceqa_to_df(hf_val, image_save_dir="./scienceqa_images",
+                                      split="validation")
+
+    model, tokenizer = load_model_for_finetuning("OpenGVLab/InternVL3_5-8B")
+    train(model, tokenizer, train_df=train_df, eval_df=eval_df,
+          output_dir="./scienceqa-finetuned")
+    """
+    from pathlib import Path
+
+    save_dir = Path(image_save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    CHOICE_LABELS = "ABCDEFGH"
+
+    rows = []
+    skipped = 0
+    for i, sample in enumerate(hf_dataset):
+        pil_image = sample["image"]   # PIL.Image or None
+        has_image = pil_image is not None
+
+        if skip_no_image and not has_image:
+            skipped += 1
+            continue
+
+        # ── 画像を保存 ──
+        image_path = None
+        if has_image:
+            image_path = str((save_dir / f"{split}_{i:06d}.jpg").resolve())
+            pil_image.convert("RGB").save(image_path, format="JPEG", quality=95)
+
+        # ── question カラム: "<image>\n{hint}\n{問題文}\nA. ...\nB. ..." ──
+        parts = []
+        if has_image:
+            parts.append("<image>")
+
+        hint = (sample.get("hint") or "").strip()
+        if hint:
+            parts.append(f"ヒント: {hint}")
+
+        parts.append(sample["question"])
+
+        choices_text = "\n".join(
+            f"{CHOICE_LABELS[j]}. {choice}"
+            for j, choice in enumerate(sample["choices"])
+        )
+        parts.append(choices_text)
+
+        question = "\n".join(parts)
+
+        # ── answer カラム: "答えはAです。{正解テキスト}\n{solution}" ──
+        answer_idx   = sample["answer"]               # int (0始まり)
+        answer_label = CHOICE_LABELS[answer_idx]      # "A", "B", ...
+        answer_text  = sample["choices"][answer_idx]  # 正解の選択肢テキスト
+
+        solution = (sample.get("solution") or "").strip()
+        answer = f"答えは{answer_label}です。{answer_text}"
+        if solution:
+            answer += f"\n{solution}"
+
+        rows.append({
+            "image":    image_path,   # str (画像あり) or None (画像なし, skip_no_image=False時)
+            "question": question,
+            "answer":   answer,
+        })
+
+    df = pd.DataFrame(rows)
+    print(f"ScienceQA 変換完了 [{split}]: {len(df)} サンプル "
+          f"(画像あり: {df['image'].notna().sum()}, "
+          f"画像なしスキップ: {skipped})")
+    return df
 
 
 # ============================================================
@@ -873,14 +1451,30 @@ def parse_args():
     parser.add_argument('--lora',         action='store_true', help='LoRA を使用')
     parser.add_argument('--lora_r',       type=int,   default=128)
     parser.add_argument('--lora_alpha',   type=int,   default=256)
+    parser.add_argument('--quantization', type=str,   default=None,
+                        choices=['4bit', '8bit'],
+                        help='量子化モード (QLoRA): 4bit / 8bit')
     parser.add_argument('--freeze_vit',   action='store_true', default=True,
                         help='ViT を凍結する (デフォルト: True)')
     parser.add_argument('--no_freeze_vit', dest='freeze_vit', action='store_false')
     parser.add_argument('--bf16',         action='store_true', default=True)
     parser.add_argument('--fp16',         action='store_true')
     parser.add_argument('--num_workers',  type=int, default=2)
-    parser.add_argument('--save_steps',   type=int, default=500)
-    parser.add_argument('--eval_steps',   type=int, default=200)
+    parser.add_argument('--save_steps',    type=int,   default=500)
+    parser.add_argument('--eval_steps',    type=int,   default=200)
+    parser.add_argument('--log_steps',     type=int,   default=10,
+                        help='ロス表示 + 生成プレビュー間隔 (optimizer step 単位)')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='勾配クリッピング閾値')
+    # ScienceQA
+    parser.add_argument('--scienceqa',          action='store_true',
+                        help='HuggingFace の ScienceQA で学習する (--train_csv より優先)')
+    parser.add_argument('--scienceqa_image_dir', type=str, default='./scienceqa_images',
+                        help='ScienceQA 画像の保存先ディレクトリ')
+    parser.add_argument('--scienceqa_train_split', type=str, default='train',
+                        help='ScienceQA 学習スプリット (例: "train" / "train[:500]")')
+    parser.add_argument('--scienceqa_eval_split',  type=str, default='validation[:200]',
+                        help='ScienceQA 評価スプリット (例: "validation[:200]")')
     return parser.parse_args()
 
 
@@ -892,9 +1486,101 @@ if __name__ == '__main__':
     args = parse_args()
 
     # ---- DataFrame の準備 ----
-    if args.train_csv:
+    if args.scienceqa:
+        # ScienceQA (HuggingFace) から DataFrame を作成
+        from datasets import load_dataset
+        print(f"ScienceQA をロード中 (train: {args.scienceqa_train_split})")
+        hf_train = load_dataset("derek-thomas/ScienceQA", split=args.scienceqa_train_split)
+        train_df = convert_scienceqa_to_df(
+            hf_train,
+            image_save_dir=args.scienceqa_image_dir,
+            split="train",
+        )
+        eval_df = None
+        if args.scienceqa_eval_split:
+            print(f"ScienceQA をロード中 (eval: {args.scienceqa_eval_split})")
+            hf_eval = load_dataset("derek-thomas/ScienceQA", split=args.scienceqa_eval_split)
+            eval_df = convert_scienceqa_to_df(
+                hf_eval,
+                image_save_dir=args.scienceqa_image_dir,
+                split="validation",
+            )
+        # モデルロード & 学習実行
+        model, tokenizer = load_model_for_finetuning(
+            model_path=args.model_path,
+            use_lora=args.lora,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            freeze_vit=args.freeze_vit,
+            dtype=torch.bfloat16 if args.bf16 else torch.float32,
+            quantization=args.quantization,
+        )
+        log_preview_df = eval_df.sample(n=min(2, len(eval_df)), random_state=42).reset_index(drop=True) \
+            if eval_df is not None and len(eval_df) > 0 else None
+        train(
+            model=model,
+            tokenizer=tokenizer,
+            train_df=train_df,
+            eval_df=eval_df,
+            log_preview_df=log_preview_df,
+            output_dir=args.output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            grad_acc=args.grad_acc,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            warmup_ratio=args.warmup_ratio,
+            max_seq_len=args.max_seq_len,
+            num_workers=args.num_workers,
+            max_tiles=args.max_tiles,
+            save_every_n_steps=args.save_steps,
+            eval_every_n_steps=args.eval_steps,
+            log_steps=args.log_steps,
+            max_grad_norm=args.max_grad_norm,
+            bf16=args.bf16,
+            fp16=args.fp16,
+        )
+    elif args.train_csv:
         train_df = pd.read_csv(args.train_csv)
         print(f"学習データ: {len(train_df)}サンプル")
+        eval_df = None
+        if args.eval_csv:
+            eval_df = pd.read_csv(args.eval_csv)
+            print(f"評価データ: {len(eval_df)}サンプル")
+        model, tokenizer = load_model_for_finetuning(
+            model_path=args.model_path,
+            use_lora=args.lora,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            freeze_vit=args.freeze_vit,
+            dtype=torch.bfloat16 if args.bf16 else torch.float32,
+            quantization=args.quantization,
+        )
+        log_preview_df = eval_df.sample(n=min(2, len(eval_df)), random_state=42).reset_index(drop=True) \
+            if eval_df is not None and len(eval_df) > 0 else None
+        train(
+            model=model,
+            tokenizer=tokenizer,
+            train_df=train_df,
+            eval_df=eval_df,
+            log_preview_df=log_preview_df,
+            output_dir=args.output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            grad_acc=args.grad_acc,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            warmup_ratio=args.warmup_ratio,
+            max_seq_len=args.max_seq_len,
+            num_workers=args.num_workers,
+            max_tiles=args.max_tiles,
+            save_every_n_steps=args.save_steps,
+            eval_every_n_steps=args.eval_steps,
+            log_steps=args.log_steps,
+            max_grad_norm=args.max_grad_norm,
+            bf16=args.bf16,
+            fp16=args.fp16,
+        )
     else:
         # デモ用ダミー DataFrame
         print("警告: --train_csv が指定されていないためデモ用データを使用します。")
@@ -1001,43 +1687,15 @@ if __name__ == '__main__':
             print("    --output_dir ./internvl35-finetuned \\")
             print("    --lora --lora_r 128 \\")
             print("    --epochs 3 --batch_size 1 --grad_acc 16")
+            print("  ScienceQA で学習する場合:")
+            print("  python finetuning_example.py \\")
+            print("    --model_path OpenGVLab/InternVL3_5-8B \\")
+            print("    --scienceqa \\")
+            print("    --scienceqa_train_split 'train[:500]' \\")
+            print("    --scienceqa_eval_split  'validation[:100]' \\")
+            print("    --scienceqa_image_dir   ./scienceqa_images \\")
+            print("    --output_dir ./scienceqa-finetuned \\")
+            print("    --lora --lora_r 128 \\")
+            print("    --epochs 3 --batch_size 1 --grad_acc 16")
             print("=" * 60)
             sys.exit(0)
-
-    # ---- 評価データ ----
-    eval_df = None
-    if args.eval_csv:
-        eval_df = pd.read_csv(args.eval_csv)
-        print(f"評価データ: {len(eval_df)}サンプル")
-
-    # ---- モデルロード ----
-    model, tokenizer = load_model_for_finetuning(
-        model_path=args.model_path,
-        use_lora=args.lora,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        freeze_vit=args.freeze_vit,
-        dtype=torch.bfloat16 if args.bf16 else torch.float32,
-    )
-
-    # ---- 学習実行 ----
-    train(
-        model=model,
-        tokenizer=tokenizer,
-        train_df=train_df,
-        eval_df=eval_df,
-        output_dir=args.output_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        grad_acc=args.grad_acc,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        max_seq_len=args.max_seq_len,
-        num_workers=args.num_workers,
-        max_tiles=args.max_tiles,
-        save_every_n_steps=args.save_steps,
-        eval_every_n_steps=args.eval_steps,
-        bf16=args.bf16,
-        fp16=args.fp16,
-    )

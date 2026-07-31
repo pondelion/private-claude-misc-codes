@@ -11,7 +11,7 @@ transformers Trainerを使わない素のPyTorchループで微調整する。
     - finetune/trainer.py: CPMTrainer.compute_loss()
 
 必要パッケージ:
-    pip install torch transformers pillow pandas peft torchvision
+    pip install torch transformers pillow pandas peft torchvision tqdm
 
 使い方:
     python finetune_example.py
@@ -37,6 +37,7 @@ import os
 import random
 import re
 from functools import partial
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -44,9 +45,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from PIL import Image
+from torch.amp import GradScaler
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 
@@ -57,9 +60,12 @@ class FinetuneConfig:
     """微調整の設定"""
 
     # --- モデル ---
-    model_name_or_path: str = "openbmb/MiniCPM-V-2_6"
+    model_name_or_path: str = "openbmb/MiniCPM-V-4_5-AWQ"
     # llm_type: "minicpm" / "llama3" / "qwen"
-    # MiniCPM-V 2.6 以降は Qwen2 ベース → "qwen"
+    # MiniCPM-V 4.5 は Qwen2.5 ベース → "qwen"
+    # ※ -AWQ 版 (openbmb/MiniCPM-V-4_5-AWQ) は LoRA finetune 可能 (autoawq 要)
+    #   ただし quantization= オプションとの併用不可 (AWQ+BnB の二重量子化はクラッシュ)
+    #   VRAM が不足する場合: 本モデル + quantization="4bit" で QLoRA を推奨
     llm_type: str = "qwen"
 
     # --- 学習 ---
@@ -75,19 +81,43 @@ class FinetuneConfig:
 
     # --- 学習対象 ---
     tune_vision: bool = False  # ViTを学習するか
-    tune_llm: bool = True      # LLMを学習するか
+    tune_llm: bool = False      # LLMを学習するか
 
     # --- LoRA (オプション) ---
-    use_lora: bool = False
+    use_lora: bool = True
     lora_r: int = 64
     lora_alpha: int = 64
     lora_dropout: float = 0.05
     lora_target_modules: str = r"llm\..*layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj)"
 
-    # --- 保存 ---
+    # --- 保存・ログ ---
     output_dir: str = "./minicpmv_finetuned"
-    save_steps: int = 500
-    logging_steps: int = 10
+    save_steps: int = 500    # チェックポイント保存間隔 (optimizer step 単位)
+    eval_steps: int = 200    # 評価間隔 (optimizer step 単位)
+    logging_steps: int = 10  # ロス表示 + 生成プレビュー間隔 (optimizer step 単位)
+
+    # --- 量子化 (QLoRA) ---
+    quantization: Optional[str] = None  # '4bit' / '8bit' / None
+    #
+    # ============================================================
+    # 量子化の仕組み: 何が量子化されるか
+    # ============================================================
+    #
+    # │ 設定                        │ 元モデル重み        │ LoRA重み   │ 計算精度 │
+    # │-----------------------------│---------------------│-----------│---------|
+    # │ AWQモデル + quantization=None│ 4bit INT (AWQ)      │ bf16 (全精度) │ bf16   │
+    # │ ベース + quantization="4bit" │ 4bit NF4 (BnB)      │ bf16 (全精度) │ bf16   │
+    # │ ベース + quantization="8bit" │ 8bit INT (BnB)      │ bf16 (全精度) │ bf16   │
+    # │ ベース + quantization=None   │ bf16 (量子化なし)   │ bf16 (全精度) │ bf16   │
+    # │ AWQモデル + quantization設定 │ → 自動で None に上書き (二重量子化防止)     │
+    # ============================================================
+    # ポイント:
+    #   - 量子化されるのは「凍結された元モデルの重み」のみ
+    #   - LoRAパラメータは常に bf16 全精度 (勾配計算が必要なため)
+    #   - 計算時は 4bit重み → bf16 に dequantize してから演算
+    #   - AWQ は calibration データを使った高品質な量子化 (BnB NF4 より僅かに高精度)
+    #   - メモリ: AWQ ≈ BnB 4bit < BnB 8bit << 量子化なし
+    # ============================================================
 
     # --- デバイス ---
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -778,6 +808,7 @@ def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
     num_warmup_steps: int,
     num_training_steps: int,
+    min_lr_ratio: float = 0.0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """
     ========================================
@@ -785,7 +816,9 @@ def get_cosine_schedule_with_warmup(
 
     lr(step) =
         step < warmup: lr_base * step / warmup
-        step >= warmup: lr_base * 0.5 * (1 + cos(pi * (step - warmup) / (total - warmup)))
+        step >= warmup: lr_base * (min_ratio + (1 - min_ratio) * 0.5 * (1 + cos(pi * progress)))
+
+    min_lr_ratio=0.0 で最終的に lr → 0
     ========================================
     """
     def lr_lambda(current_step: int) -> float:
@@ -794,78 +827,159 @@ def get_cosine_schedule_with_warmup(
         progress = float(current_step - num_warmup_steps) / float(
             max(1, num_training_steps - num_warmup_steps)
         )
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(min_lr_ratio, cosine)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ========================================
-# 10. メイン学習ループ
+# 10. AMP (混合精度) 設定
 # ========================================
-def train(
-    df: pd.DataFrame,
-    config: FinetuneConfig = None,
-    image_col: str = "image_path",
-    question_col: str = "question",
-    answer_col: str = "answer",
-):
+def setup_amp(
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[Dict, GradScaler]:
     """
-    MiniCPM-V 4.5 の微調整を実行する
+    Mixed Precision (AMP) の設定
 
     ========================================
-    引数:
-        df: pandas DataFrame - 学習データのメタデータ
-            必須カラム: image_path, question, answer
-        config: FinetuneConfig - 学習設定
-        image_col, question_col, answer_col: DataFrameのカラム名
-
-    処理の流れ:
-        1. モデル・トークナイザの読み込み
-        2. 学習対象パラメータの設定 (LoRA or full)
-        3. DataFrame → Dataset → DataLoader
-        4. Optimizerとスケジューラの設定
-        5. 学習ループ (forward → loss → backward → step)
-        6. チェックポイント保存
+    戦略
     ========================================
+    bfloat16: torch.autocast(dtype=bf16), GradScaler 無効 (bf16 は安定)
+    float16:  torch.autocast(dtype=fp16), GradScaler 有効 (スケーリング必要)
+    float32:  torch.autocast(enabled=False), GradScaler 無効
+
+    ========================================
+    出力
+    ========================================
+    amp_ctx_kwargs : dict      - torch.autocast に渡す kwargs
+    scaler         : GradScaler - fp16 時のみ有効、それ以外は no-op
+    """
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    use_amp = dtype in (torch.bfloat16, torch.float16)
+    use_fp16 = dtype == torch.float16
+
+    amp_ctx_kwargs = dict(
+        device_type=device_type,
+        dtype=dtype if use_amp else torch.float32,
+        enabled=use_amp,
+    )
+
+    # bf16 は GradScaler 不要 (enabled=False で no-op)
+    scaler = GradScaler(device_type, enabled=use_fp16)
+
+    return amp_ctx_kwargs, scaler
+
+
+# ========================================
+# 11. モデルロード
+# ========================================
+def load_model_for_finetuning(config: FinetuneConfig = None):
+    """
+    FinetuneConfig からモデルとトークナイザをロードし、学習対象パラメータを設定する。
+
+    ========================================
+    出力
+    ========================================
+    model     : ファインチューニング可能な状態のモデル (CPUまたはGPU)
+    tokenizer : AutoTokenizer
+
+    ========================================
+    モデル構成の選択肢
+    ========================================
+    FullFT (デフォルト):
+        tune_llm=True, tune_vision=False
+        → LLM 全体を学習, ViT は凍結
+
+    LoRA:
+        use_lora=True, tune_llm=False
+        → LLM の attention 投影層のみ LoRA, ViT は凍結
+
+    VisionFT:
+        tune_vision=True, tune_llm=False
+        → ViT のみ学習
     """
     if config is None:
         config = FinetuneConfig()
 
-    print(f"[Config] model={config.model_name_or_path}")
-    print(f"[Config] device={config.device}, dtype={config.dtype}")
-    print(f"[Config] lr={config.learning_rate}, epochs={config.num_epochs}")
-    print(f"[Config] batch_size={config.batch_size}, grad_accum={config.gradient_accumulation_steps}")
+    print(f"モデルロード: {config.model_name_or_path}")
+    print(f"dtype: {config.dtype}")
 
-    # ========================================
-    # 10.1 モデル読み込み
-    # ========================================
-    print("[1/6] Loading model...")
+    # AWQ モデルの自動検出
+    # AWQ は事前量子化済みのため BitsAndBytes と併用不可 (二重量子化)
+    # モデル名に "awq" が含まれる場合は quantization を強制的に None にする
+    _is_awq = 'awq' in config.model_name_or_path.lower()
+    _quantization = config.quantization
+    if _is_awq and _quantization is not None:
+        print(f"  ⚠ AWQ モデルが検出されました。quantization={_quantization!r} を無視して None に上書きします。")
+        _quantization = None
+
+    # 量子化設定 (QLoRA / BitsAndBytes)
+    _bnb_cfg = None
+    if _quantization is not None:
+        from transformers import BitsAndBytesConfig
+        if _quantization == '4bit':
+            _bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=config.dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4',
+            )
+        elif _quantization == '8bit':
+            _bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            raise ValueError(f"quantization は '4bit' / '8bit' / None のみ有効: {_quantization!r}")
+        print(f"量子化: {_quantization} (QLoRA / BitsAndBytes)")
+    elif _is_awq:
+        print("量子化: AWQ (事前量子化済みモデル、autoawq 要)")
+
+    # AWQ または BnB 量子化時は device_map="auto" が必須 (.to(device) 不可)
+    _device_map = "auto" if (_is_awq or _quantization is not None) else None
+
+    # AWQ + trust_remote_code 互換性パッチ:
+    # MiniCPMVConfig がクラス属性 quantization_config=None を持つため
+    # transformers 5.x の hasattr() 検出 → .get() 呼び出しでクラッシュする。
+    # config を事前ロードして None をパッチすることで回避する。
+    _pretrained_cfg = None
+    if _is_awq:
+        from transformers import AutoConfig
+        _pretrained_cfg = AutoConfig.from_pretrained(
+            config.model_name_or_path, trust_remote_code=True
+        )
+        if getattr(_pretrained_cfg, 'quantization_config', 'sentinel') is None:
+            _pretrained_cfg.quantization_config = {}
+
     model = AutoModel.from_pretrained(
         config.model_name_or_path,
         trust_remote_code=True,
-        torch_dtype=config.dtype,
-        init_vision=True,
-        init_audio=False,
-        init_tts=False,
+        dtype=config.dtype,
+        device_map=_device_map,
+        quantization_config=_bnb_cfg,
+        **({"config": _pretrained_cfg} if _pretrained_cfg is not None else {}),
     )
     tokenizer = AutoTokenizer.from_pretrained(
         config.model_name_or_path, trust_remote_code=True
     )
 
-    # ========================================
-    # 10.2 学習対象の設定
-    # ========================================
-    print("[2/6] Configuring trainable parameters...")
+    # ---- パラメータ凍結設定 ----
     if not config.tune_vision:
         model.vpm.requires_grad_(False)
     if not config.tune_llm:
         model.llm.requires_grad_(False)
 
+    # 量子化後処理: kbit 学習の準備 (LoRA 前に必須)
+    # BnB 量子化モデルと AWQ モデルの両方に適用
+    if _quantization is not None or _is_awq:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        print("prepare_model_for_kbit_training 完了")
+
     if config.use_lora:
         from peft import LoraConfig, get_peft_model
 
         if config.tune_llm:
-            raise ValueError("Cannot use LoRA and tune_llm=True simultaneously")
+            raise ValueError("LoRA 使用時は tune_llm=False にしてください")
 
         for param in model.llm.parameters():
             param.requires_grad = False
@@ -884,22 +998,261 @@ def train(
         )
         model = get_peft_model(model, lora_config)
 
-    model.to(config.device)
-    model.train()
+    model.config.use_cache = False  # 訓練時はKVキャッシュを無効化
 
-    # パラメータ数の表示
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"  Trainable: {trainable:,} / Total: {total:,} ({100 * trainable / total:.2f}%)")
+    print(f"訓練可能パラメータ: {trainable:,} / {total:,} ({100 * trainable / total:.1f}%)")
+
+    return model, tokenizer
+
+
+# ========================================
+# 12. 評価関数
+# ========================================
+@torch.no_grad()
+def evaluate(
+    model,
+    tokenizer,
+    eval_loader: DataLoader,
+    device: torch.device,
+    amp_ctx_kwargs: Dict,
+    vocab_size: int,
+) -> Dict:
+    """
+    評価データセットでの平均損失を計算する。
+
+    ========================================
+    出力
+    ========================================
+    {"loss": float}
+
+    ========================================
+    注意
+    ========================================
+    compute_loss() が batch.pop("labels") でバッチを破壊するため、
+    各バッチを dict() でシャローコピーしてから渡す。
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    for batch in tqdm(eval_loader, desc="Eval", leave=False):
+        # テンソルをデバイスへ転送
+        batch = {
+            "input_ids":      batch["input_ids"].to(device),
+            "position_ids":   batch["position_ids"].to(device),
+            "labels":         batch["labels"].to(device),
+            "attention_mask": batch["attention_mask"].to(device),
+            "pixel_values":   batch["pixel_values"],   # List のまま (モデル内部で転送)
+            "image_bound":    batch["image_bound"],
+            "tgt_sizes":      batch["tgt_sizes"],
+        }
+
+        with torch.autocast(**amp_ctx_kwargs):
+            # compute_loss は batch.pop("labels") するため shallow copy で渡す
+            loss = compute_loss(model, dict(batch), vocab_size)
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    model.train()
+    return {"loss": total_loss / max(num_batches, 1)}
+
+
+# ========================================
+# 13. 単一サンプル推論
+# ========================================
+def generate_response(
+    model,
+    tokenizer,
+    image_path: Optional[str] = None,
+    question: str = "",
+    max_new_tokens: int = 512,
+    device: Optional[torch.device] = None,
+) -> str:
+    """
+    単一サンプルの推論 (ロギング用)
+
+    MiniCPM-V の model.chat() API を使用する。
+
+    ========================================
+    Shape
+    ========================================
+    入力:
+        image_path: str (画像パス)
+        question:   str (質問テキスト)
+
+    内部:
+        msgs[0]["content"]: [PIL.Image, str]
+        → model.chat() が内部でスライス分割・Resampler処理
+
+    出力:
+        response : str - 生成テキスト
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    # ---- メッセージ構築 ----
+    content = []
+    if image_path and Path(image_path).exists():
+        pil_img = Image.open(image_path).convert("RGB")
+        content.append(pil_img)
+    content.append(question)
+
+    msgs = [{"role": "user", "content": content}]
+
+    model.eval()
+    with torch.no_grad():
+        response = model.chat(
+            image=None,  # content に PIL.Image を直接入れる場合は None
+            msgs=msgs,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            sampling=False,  # greedy decoding
+        )
+
+    return response
+
+
+# ========================================
+# 14. 学習中サンプル生成表示
+# ========================================
+def log_sample_predictions(
+    model,
+    tokenizer,
+    sample_df: pd.DataFrame,
+    device: torch.device,
+    global_step: int,
+    image_col: str = "image_path",
+    question_col: str = "question",
+    answer_col: str = "answer",
+    max_new_tokens: int = 128,
+    display_size: tuple = (300, 200),
+):
+    """
+    logging_steps ごとに val サンプルを generate して画像・質問・生成文を表示する。
+
+    呼び出し元で eval_df から固定サンプルを切り出して渡すことで、
+    ステップをまたいで同じサンプルに対する生成変化を追える。
+
+        # 呼び出し側での準備例
+        log_preview_df = eval_df.sample(n=2, random_state=42).reset_index(drop=True)
+        # logging_steps ごとに
+        log_sample_predictions(model, tokenizer, log_preview_df, device, global_step)
+
+    DataFrame カラム:
+        image_path : str  画像ファイルパス
+        question   : str  質問テキスト
+        answer     : str  正解テキスト
+
+    引数:
+        sample_df     : 表示対象の固定サンプル DataFrame (呼び出し元で固定しておく)
+        global_step   : 現在のステップ数 (表示用ラベル)
+        image_col     : 画像パスカラム名
+        question_col  : 質問カラム名
+        answer_col    : 正解カラム名
+        max_new_tokens: 生成の最大トークン数 (ログ用なので短めでよい)
+        display_size  : Jupyter 表示時のリサイズ後サイズ (width, height)
+    """
+    model.eval()
+
+    print(f"\n{'='*60}")
+    print(f"[Step {global_step}] val サンプル生成プレビュー")
+    print(f"{'='*60}")
+
+    for i, (_, row) in enumerate(sample_df.iterrows()):
+        image_path   = row.get(image_col, None)
+        question_raw = row.get(question_col, "")
+        ground_truth = row.get(answer_col, "")
+
+        print(f"\n--- サンプル {i + 1} ---")
+        print(f"質問: {str(question_raw)[:120]}{'...' if len(str(question_raw)) > 120 else ''}")
+        print(f"正解: {str(ground_truth)[:120]}{'...' if len(str(ground_truth)) > 120 else ''}")
+
+        # 画像表示 (Jupyter のみ、失敗時はパスを print してフォールバック)
+        if image_path and Path(str(image_path)).exists():
+            try:
+                from IPython.display import display as ipy_display
+                pil_img = Image.open(image_path).convert("RGB")
+                pil_img_small = pil_img.resize(display_size, Image.LANCZOS)
+                ipy_display(pil_img_small)
+            except Exception:
+                print(f"[画像: {image_path}]")
+
+        # generate して生成文を表示
+        try:
+            response = generate_response(
+                model=model,
+                tokenizer=tokenizer,
+                image_path=image_path if (image_path and Path(str(image_path)).exists()) else None,
+                question=str(question_raw),
+                max_new_tokens=max_new_tokens,
+                device=device,
+            )
+            print(f"生成: {response[:200]}{'...' if len(response) > 200 else ''}")
+        except Exception as e:
+            print(f"生成エラー: {e}")
+
+    print(f"{'='*60}\n")
+    model.train()
+
+
+# ========================================
+# 15. メイン学習ループ
+# ========================================
+def train(
+    model,
+    tokenizer,
+    train_df: pd.DataFrame,
+    eval_df: Optional[pd.DataFrame] = None,
+    log_preview_df: Optional[pd.DataFrame] = None,
+    config: FinetuneConfig = None,
+    image_col: str = "image_path",
+    question_col: str = "question",
+    answer_col: str = "answer",
+    save_checkpoint: bool = False,
+):
+    """
+    MiniCPM-V 4.5 の微調整学習ループ。
+
+    引数:
+        model          : load_model_for_finetuning() でロードしたモデル
+        tokenizer      : 対応するトークナイザ
+        train_df       : pd.DataFrame  学習データ (image_path, question, answer 必須)
+        eval_df        : pd.DataFrame  評価データ (省略可)
+        log_preview_df : pd.DataFrame  logging_steps ごとに generate 表示する固定サンプル。
+                         None の場合はスキップ。eval_df から事前にサンプリングして渡す:
+                             log_preview_df = eval_df.sample(n=2, random_state=42)
+        config         : FinetuneConfig  学習設定
+        image_col      : 画像パスカラム名
+        question_col   : 質問カラム名
+        answer_col     : 正解カラム名
+
+    ========================================
+    処理の流れ
+    ========================================
+        1. DataFrame → Dataset → DataLoader
+        2. Optimizer + Cosine Warmup Scheduler
+        3. AMP (GradScaler) 設定
+        4. 初期評価 + 生成プレビュー
+        5. 学習ループ (forward → loss → backward → clip → step)
+        6. logging_steps ごとにロス表示 + 生成プレビュー
+        7. eval_steps ごとに評価
+        8. save_steps ごとにチェックポイント保存
+        9. エポック末評価
+       10. 最終モデル保存
+    """
+    if config is None:
+        config = FinetuneConfig()
+
+    device = torch.device(config.device)
 
     # ========================================
-    # 10.3 データセット構築
+    # 1. データセット構築
     # ========================================
-    print("[3/6] Building dataset...")
-    raw_data = dataframe_to_raw_data(df, image_col, question_col, answer_col)
-    print(f"  Samples: {len(raw_data)}")
+    raw_train = dataframe_to_raw_data(train_df, image_col, question_col, answer_col)
 
-    # slice_config: モデルのconfigから取得
     if hasattr(model.config, "slice_config"):
         model.config.slice_config.max_slice_nums = config.max_slice_nums
         slice_config = model.config.slice_config.to_dict()
@@ -911,124 +1264,212 @@ def train(
         }
 
     batch_vision = getattr(model.config, "batch_vision_input", False)
+    patch_size   = getattr(model.config, "patch_size", 14)
+    query_nums   = getattr(model.config, "query_num", 64)
+    vocab_size   = model.config.vocab_size
 
-    dataset = MiniCPMVDataset(
-        raw_data=raw_data,
+    _collate = partial(collate_fn, max_length=config.max_length)
+
+    train_dataset = MiniCPMVDataset(
+        raw_data=raw_train,
         tokenizer=tokenizer,
         transform=build_transform(),
         slice_config=slice_config,
         llm_type=config.llm_type,
-        patch_size=getattr(model.config, "patch_size", 14),
-        query_nums=getattr(model.config, "query_num", 64),
+        patch_size=patch_size,
+        query_nums=query_nums,
         batch_vision=batch_vision,
         max_length=config.max_length,
     )
-
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=partial(collate_fn, max_length=config.max_length),
+        collate_fn=_collate,
         num_workers=2,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
     )
 
+    eval_loader = None
+    if eval_df is not None:
+        raw_eval = dataframe_to_raw_data(eval_df, image_col, question_col, answer_col)
+        eval_dataset = MiniCPMVDataset(
+            raw_data=raw_eval,
+            tokenizer=tokenizer,
+            transform=build_transform(),
+            slice_config=slice_config,
+            llm_type=config.llm_type,
+            patch_size=patch_size,
+            query_nums=query_nums,
+            batch_vision=batch_vision,
+            max_length=config.max_length,
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=_collate,
+            num_workers=2,
+            pin_memory=(device.type == "cuda"),
+        )
+
     # ========================================
-    # 10.4 Optimizer + Scheduler
+    # 2. Optimizer + Scheduler
     # ========================================
-    print("[4/6] Setting up optimizer...")
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        trainable_params,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
+        betas=(0.9, 0.95),
+        eps=1e-8,
     )
 
-    num_training_steps = (
-        len(dataloader) * config.num_epochs // config.gradient_accumulation_steps
-    )
+    num_training_steps = math.ceil(len(train_loader) / config.gradient_accumulation_steps) * config.num_epochs
     num_warmup_steps = int(num_training_steps * config.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
 
-    print(f"  Total steps: {num_training_steps}, Warmup: {num_warmup_steps}")
-
-    vocab_size = model.config.vocab_size
+    # ========================================
+    # 3. AMP (GradScaler)
+    # ========================================
+    amp_ctx_kwargs, scaler = setup_amp(config.dtype, device)
 
     # ========================================
-    # 10.5 学習ループ
+    # 設定サマリー表示
     # ========================================
-    print("[5/6] Training...")
+    precision_name = {torch.bfloat16: "bfloat16", torch.float16: "float16"}.get(config.dtype, "float32")
+    print(f"\n訓練設定:")
+    print(f"  サンプル数:          train={len(train_dataset)}, eval={len(eval_df) if eval_df is not None else 0}")
+    print(f"  バッチサイズ:        {config.batch_size}  (実効: {config.batch_size * config.gradient_accumulation_steps})")
+    print(f"  エポック数:          {config.num_epochs}")
+    print(f"  総ステップ数:        {num_training_steps}  (warmup: {num_warmup_steps})")
+    print(f"  学習率:              {config.learning_rate}")
+    print(f"  Precision:           {precision_name}")
+    print(f"  訓練可能パラメータ:  {sum(p.numel() for p in trainable_params):,}")
+    print(f"  デバイス:            {device}")
+    print("-" * 60)
+
+    # 量子化モデル (device_map="auto") はすでに GPU に配置されているため .to() 不可
+    # BnB: is_loaded_in_4bit / is_loaded_in_8bit、AWQ: モデル名で判定
+    _is_quantized = (
+        getattr(model, 'is_loaded_in_4bit', False)
+        or getattr(model, 'is_loaded_in_8bit', False)
+        or 'awq' in getattr(config, 'model_name_or_path', '').lower()
+    )
+    if not _is_quantized:
+        model = model.to(device)
+    model.train()
     os.makedirs(config.output_dir, exist_ok=True)
+
+    # ========================================
+    # 4. 初期評価
+    # ========================================
+    optimizer_step = 0
+    if eval_loader is not None:
+        init_eval = evaluate(model, tokenizer, eval_loader, device, amp_ctx_kwargs, vocab_size)
+        print(f"初期評価  loss: {init_eval['loss']:.4f}")
+    if log_preview_df is not None:
+        log_sample_predictions(
+            model, tokenizer, log_preview_df, device, optimizer_step,
+            image_col=image_col, question_col=question_col, answer_col=answer_col,
+        )
+
+    # ========================================
+    # 5. 学習ループ
+    # ========================================
     global_step = 0
-    accumulation_loss = 0.0
+    accumulated_loss = 0.0
 
     for epoch in range(config.num_epochs):
+        print(f"\n=== Epoch {epoch + 1}/{config.num_epochs} ===")
         model.train()
-        epoch_loss = 0.0
-        num_batches = 0
 
-        for step, batch in enumerate(dataloader):
-            # --- バッチをデバイスへ転送 ---
-            batch["input_ids"] = batch["input_ids"].to(config.device)
-            batch["position_ids"] = batch["position_ids"].to(config.device)
-            batch["labels"] = batch["labels"].to(config.device)
-            batch["attention_mask"] = batch["attention_mask"].to(config.device)
-            # pixel_values, image_bound, tgt_sizes はリストのまま
-            # (モデル内部でデバイスに転送される)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", dynamic_ncols=True)
+        for batch_idx, batch in enumerate(pbar):
+            # ---- バッチをデバイスへ転送 ----
+            batch = {
+                "input_ids":      batch["input_ids"].to(device),
+                "position_ids":   batch["position_ids"].to(device),
+                "labels":         batch["labels"].to(device),
+                "attention_mask": batch["attention_mask"].to(device),
+                "pixel_values":   batch["pixel_values"],   # List のまま
+                "image_bound":    batch["image_bound"],
+                "tgt_sizes":      batch["tgt_sizes"],
+            }
 
-            # --- Forward + Loss ---
-            loss = compute_loss(model, batch, vocab_size)
-            # loss: スカラー
+            # ---- フォワードパス ----
+            with torch.autocast(**amp_ctx_kwargs):
+                loss = compute_loss(model, dict(batch), vocab_size)
+                # compute_loss は batch.pop("labels") するため dict() でコピー
 
-            # --- Gradient accumulation ---
+            # 勾配累積: grad_acc で割って平均化
             loss = loss / config.gradient_accumulation_steps
-            loss.backward()
-            accumulation_loss += loss.item()
+            scaler.scale(loss).backward()
+            accumulated_loss += loss.item()
 
-            if (step + 1) % config.gradient_accumulation_steps == 0:
-                # --- Gradient clipping ---
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    config.max_grad_norm,
+            global_step += 1
+
+            is_update_step = (
+                global_step % config.gradient_accumulation_steps == 0
+                or global_step == len(train_loader)
+            )
+            if is_update_step:
+                # ---- 勾配クリップ + Optimizer Step ----
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_step += 1
+
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix(
+                    loss=f"{accumulated_loss:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    step=optimizer_step,
                 )
 
-                # --- Optimizer step ---
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-
-                if global_step % config.logging_steps == 0:
-                    avg_loss = accumulation_loss / config.logging_steps
-                    lr = scheduler.get_last_lr()[0]
+                # ---- ロギング + 生成プレビュー ----
+                if optimizer_step % config.logging_steps == 0:
+                    avg_loss = accumulated_loss / config.logging_steps
                     print(
-                        f"  [Epoch {epoch+1}/{config.num_epochs}] "
-                        f"Step {global_step}/{num_training_steps} "
-                        f"Loss={avg_loss:.4f} LR={lr:.2e}"
+                        f"  [Step {optimizer_step}/{num_training_steps}] "
+                        f"loss={avg_loss:.4f}, lr={current_lr:.2e}"
                     )
-                    accumulation_loss = 0.0
+                    accumulated_loss = 0.0
 
-                # --- チェックポイント保存 ---
-                if config.save_steps > 0 and global_step % config.save_steps == 0:
-                    save_dir = os.path.join(config.output_dir, f"checkpoint-{global_step}")
-                    _save_checkpoint(model, tokenizer, save_dir, config.use_lora)
+                    if log_preview_df is not None:
+                        log_sample_predictions(
+                            model, tokenizer, log_preview_df, device, optimizer_step,
+                            image_col=image_col, question_col=question_col, answer_col=answer_col,
+                        )
 
-            epoch_loss += loss.item() * config.gradient_accumulation_steps
-            num_batches += 1
+                # ---- 中間評価 ----
+                if eval_loader is not None and optimizer_step % config.eval_steps == 0:
+                    eval_result = evaluate(model, tokenizer, eval_loader, device, amp_ctx_kwargs, vocab_size)
+                    print(f"  [Eval Step {optimizer_step}] eval_loss={eval_result['loss']:.4f}")
+                    model.train()
+
+                # ---- チェックポイント保存 ----
+                if save_checkpoint and config.save_steps > 0 and optimizer_step % config.save_steps == 0:
+                    ckpt_path = os.path.join(config.output_dir, f"checkpoint-{optimizer_step}")
+                    _save_checkpoint(model, tokenizer, ckpt_path, config.use_lora)
 
             # メモリ解放
-            del loss
             torch.cuda.empty_cache()
 
-        avg_epoch_loss = epoch_loss / max(num_batches, 1)
-        print(f"  Epoch {epoch+1} completed. Avg Loss={avg_epoch_loss:.4f}")
+        # ---- エポック末評価 ----
+        if eval_loader is not None:
+            epoch_eval = evaluate(model, tokenizer, eval_loader, device, amp_ctx_kwargs, vocab_size)
+            print(f"  Epoch {epoch + 1} 評価 loss: {epoch_eval['loss']:.4f}")
 
     # ========================================
-    # 10.6 最終モデル保存
+    # 6. 最終モデル保存
     # ========================================
-    print("[6/6] Saving final model...")
-    _save_checkpoint(model, tokenizer, config.output_dir, config.use_lora)
-    print(f"  Model saved to {config.output_dir}")
-    print("Done!")
+    if save_checkpoint:
+        _save_checkpoint(model, tokenizer, config.output_dir, config.use_lora)
+        print(f"\n学習完了。最終モデル保存: {config.output_dir}")
 
 
 def _save_checkpoint(model, tokenizer, output_dir: str, use_lora: bool = False):
@@ -1049,7 +1490,135 @@ def _save_checkpoint(model, tokenizer, output_dir: str, use_lora: bool = False):
         else:
             torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
     tokenizer.save_pretrained(output_dir)
-    print(f"  Checkpoint saved to {output_dir}")
+    print(f"  チェックポイント保存: {output_dir}")
+
+
+# ========================================
+# 16. ScienceQA データセット変換
+# ========================================
+
+def convert_scienceqa_to_df(
+    hf_dataset,
+    image_save_dir: str,
+    split: str = "train",
+    skip_no_image: bool = True,
+) -> pd.DataFrame:
+    """
+    HuggingFace の ScienceQA データセットを MiniCPMVDataset 用 DataFrame に変換する。
+
+    ========================================
+    入力
+    ========================================
+    hf_dataset:
+        load_dataset("derek-thomas/ScienceQA", split="train[:500]") の返り値
+        features:
+            image    : PIL.Image or None  (画像なしサンプルは None)
+            question : str               (問題文)
+            choices  : list[str]         (選択肢 例: ["cat", "dog", "fish"])
+            answer   : int               (正解の選択肢インデックス, 0始まり)
+            hint     : str or None       (ヒント文)
+            solution : str or None       (解説)
+
+    image_save_dir : str
+        PIL画像をJPEGとして保存するディレクトリ
+
+    split : str
+        保存ファイル名のプレフィックス用 (例: "train", "validation", "test")
+
+    skip_no_image : bool
+        image=None のサンプル (テキストのみ問題) をスキップするか。
+
+    ========================================
+    出力 DataFrame columns
+    ========================================
+    image_path : str
+        保存した画像ファイルの絶対パス
+    question   : str
+        "<image>\\nヒント: {hint}\\n{問題文}\\nA. ...\\nB. ..." 形式
+        ※ hint が空の場合は hint 行を省略
+    answer     : str
+        "答えはAです。{正解テキスト}\\n{solution}" 形式
+        ※ solution が空の場合は solution 行を省略
+
+    ========================================
+    使用例
+    ========================================
+    from datasets import load_dataset
+
+    hf_ds = load_dataset("derek-thomas/ScienceQA", split="train[:500]")
+    train_df = convert_scienceqa_to_df(hf_ds, image_save_dir="./scienceqa_images")
+
+    hf_val = load_dataset("derek-thomas/ScienceQA", split="validation[:100]")
+    eval_df = convert_scienceqa_to_df(hf_val, image_save_dir="./scienceqa_images",
+                                      split="validation")
+
+    config = FinetuneConfig(use_lora=True)
+    model, tokenizer = load_model_for_finetuning(config)
+    log_preview_df = eval_df.sample(n=2, random_state=42).reset_index(drop=True)
+    train(model, tokenizer, train_df=train_df, eval_df=eval_df,
+          log_preview_df=log_preview_df, config=config)
+    """
+    save_dir = Path(image_save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    CHOICE_LABELS = "ABCDEFGH"
+
+    rows = []
+    skipped = 0
+    for i, sample in enumerate(hf_dataset):
+        pil_image = sample["image"]   # PIL.Image or None
+        has_image = pil_image is not None
+
+        if skip_no_image and not has_image:
+            skipped += 1
+            continue
+
+        # ── 画像を保存 ──
+        image_path = None
+        if has_image:
+            image_path = str((save_dir / f"{split}_{i:06d}.jpg").resolve())
+            pil_image.convert("RGB").save(image_path, format="JPEG", quality=95)
+
+        # ── question カラム: "<image>\n{hint}\n{問題文}\nA. ...\nB. ..." ──
+        parts = []
+        if has_image:
+            parts.append("<image>")
+
+        hint = (sample.get("hint") or "").strip()
+        if hint:
+            parts.append(f"ヒント: {hint}")
+
+        parts.append(sample["question"])
+
+        choices_text = "\n".join(
+            f"{CHOICE_LABELS[j]}. {choice}"
+            for j, choice in enumerate(sample["choices"])
+        )
+        parts.append(choices_text)
+
+        question = "\n".join(parts)
+
+        # ── answer カラム: "答えはAです。{正解テキスト}\n{solution}" ──
+        answer_idx   = sample["answer"]
+        answer_label = CHOICE_LABELS[answer_idx]
+        answer_text  = sample["choices"][answer_idx]
+
+        solution = (sample.get("solution") or "").strip()
+        answer = f"答えは{answer_label}です。{answer_text}"
+        if solution:
+            answer += f"\n{solution}"
+
+        rows.append({
+            "image_path": image_path,
+            "question":   question,
+            "answer":     answer,
+        })
+
+    df = pd.DataFrame(rows)
+    print(f"ScienceQA 変換完了 [{split}]: {len(df)} サンプル "
+          f"(画像あり: {df['image_path'].notna().sum()}, "
+          f"画像なしスキップ: {skipped})")
+    return df
 
 
 # ========================================
@@ -1066,10 +1635,10 @@ def example_usage():
 
     # --- 1. 学習データをDataFrameで準備 ---
     # 実際には CSVやParquet から読み込む:
-    #   df = pd.read_csv("train_data.csv")
-    #   df = pd.read_parquet("train_data.parquet")
+    #   train_df = pd.read_csv("train_data.csv")
+    #   eval_df  = pd.read_csv("eval_data.csv")
 
-    df = pd.DataFrame([
+    train_df = pd.DataFrame([
         {
             "image_path": "/path/to/image1.jpg",
             "question": "この画像に何が写っていますか？",
@@ -1087,13 +1656,21 @@ def example_usage():
         },
     ])
 
+    eval_df = pd.DataFrame([
+        {
+            "image_path": "/path/to/eval1.jpg",
+            "question": "画像の内容を説明してください。",
+            "answer": "画像には建物が写っています。",
+        },
+    ])
+
     print("学習データ:")
-    print(df.to_string(index=False))
+    print(train_df.to_string(index=False))
     print()
 
     # --- 2. 設定 ---
     config = FinetuneConfig()
-    config.model_name_or_path = "openbmb/MiniCPM-V-2_6"
+    config.model_name_or_path = "openbmb/MiniCPM-V-4_5-AWQ"
     config.num_epochs = 3
     config.learning_rate = 1e-5
     config.batch_size = 1
@@ -1104,6 +1681,9 @@ def example_usage():
     config.tune_llm = True
     config.use_lora = False
     config.output_dir = "./minicpmv_finetuned"
+    config.logging_steps = 10
+    config.eval_steps = 50
+    config.save_steps = 200
 
     # --- LoRAを使う場合 ---
     # config.use_lora = True
@@ -1118,11 +1698,19 @@ def example_usage():
     print(f"  LoRA: {config.use_lora}")
     print()
 
-    # --- 3. 学習実行 ---
-    # 実際に実行するには画像ファイルが必要
-    # train(df, config)
+    # --- 3. モデルロード ---
+    # model, tokenizer = load_model_for_finetuning(config)
 
-    print("train(df, config) を呼び出すと学習が開始されます。")
+    # --- 4. 生成プレビュー用サンプル ---
+    # eval_df が存在する場合は事前にサンプリング
+    # log_preview_df = eval_df.sample(n=min(2, len(eval_df)), random_state=42).reset_index(drop=True)
+
+    # --- 5. 学習実行 ---
+    # 実際に実行するには画像ファイルとGPUが必要
+    # train(model, tokenizer, train_df, eval_df, log_preview_df, config)
+
+    print("load_model_for_finetuning(config) → train(model, tokenizer, train_df, eval_df, log_preview_df, config)")
+    print("を呼び出すと学習が開始されます。")
     print("（実行には画像ファイルとGPUが必要）")
 
 

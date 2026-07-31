@@ -699,6 +699,7 @@ def load_model_for_finetuning(
     freeze_vision: bool = True,
     freeze_merger: bool = False,
     compute_dtype: Optional[torch.dtype] = None,
+    quantization: Optional[str] = None,
 ):
     """
     ファインチューニング用モデルロード
@@ -744,12 +745,32 @@ def load_model_for_finetuning(
     print(f"モデルロード: {model_path}")
     print(f"compute_dtype: {compute_dtype}")
 
-    # モデルロード (bf16 で直接ロード)
+    # 量子化設定 (QLoRA)
+    _bnb_cfg = None
+    if quantization is not None:
+        from transformers import BitsAndBytesConfig
+        if quantization == '4bit':
+            _bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4',
+            )
+        elif quantization == '8bit':
+            _bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            raise ValueError(f"quantization は '4bit' / '8bit' / None のみ有効: {quantization!r}")
+        print(f"量子化: {quantization} (QLoRA)")
+
+    # モデルロード
+    # 量子化時は device_map="auto" が必須 (.to(device) 不可)
+    _device_map = "auto" if quantization is not None else None
     model = ModelClass.from_pretrained(
         model_path,
         torch_dtype=compute_dtype,
-        device_map=None,  # 後で .to(device) する
+        device_map=_device_map,
         attn_implementation="flash_attention_2",  # FlashAttention2推奨
+        quantization_config=_bnb_cfg,
     )
 
     processor = AutoProcessor.from_pretrained(model_path)
@@ -757,6 +778,12 @@ def load_model_for_finetuning(
     # ========================================
     # パラメータの訓練設定
     # ========================================
+    # 量子化後処理: kbit 学習の準備 (LoRA 前に必須)
+    if quantization is not None:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        print("prepare_model_for_kbit_training 完了")
+
     if use_lora:
         # LoRA 設定
         try:
@@ -1291,7 +1318,10 @@ def train(
     # ========================================
     # 4. モデルを GPU に移動
     # ========================================
-    model = model.to(device)
+    # 量子化モデル (device_map="auto") はすでに GPU に配置されているため .to() 不可
+    _is_quantized = getattr(model, 'is_loaded_in_4bit', False) or getattr(model, 'is_loaded_in_8bit', False)
+    if not _is_quantized:
+        model = model.to(device)
     model.train()
 
     # ========================================
@@ -1323,6 +1353,14 @@ def train(
     if eval_loader is not None:
         eval_result = evaluate(model, eval_loader, device, amp_ctx_kwargs)
         print(f"初期評価 loss: {eval_result['loss']:.4f}")
+    if log_preview_df is not None:
+        log_sample_predictions(
+            model=model,
+            processor=processor,
+            sample_df=log_preview_df,
+            device=device,
+            global_step=global_step,
+        )
 
     for epoch in range(epochs):
         print(f"\n=== Epoch {epoch + 1}/{epochs} ===")
@@ -1467,6 +1505,9 @@ def parse_args() -> argparse.Namespace:
                    help="LoRA alpha (スケーリング係数)")
     p.add_argument("--lora_dropout", type=float, default=0.05,
                    help="LoRAドロップアウト率")
+    p.add_argument("--quantization", type=str, default=None,
+                   choices=["4bit", "8bit"],
+                   help="量子化モード (QLoRA): 4bit / 8bit")
 
     # Vision 設定
     p.add_argument("--freeze_vision", action="store_true", default=True,
@@ -1500,6 +1541,7 @@ def main():
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         freeze_vision=freeze_vision,
+        quantization=args.quantization,
     )
 
     # ========================================
