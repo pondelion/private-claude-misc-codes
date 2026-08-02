@@ -1,0 +1,72 @@
+ticker: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+
+=== task: description ===
+ground truth: [MOCK DESCRIPTION] ETH-USD について、2025-05-16から2025-07-24までの70本の期間は上昇基調（期間騰落率 +46.2%）。高値 3856.77 / 安値 2116.68、日次リターンのボラティリティ約3.11%。陽線 41本 / 陰線 29本。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×77<|vision_end|><|vision_start|><|image_pad|>×70<|vision_end|>asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+context assets tile image (1, left-to-right top-to-bottom): BTC-USD
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ETH-USD について、2025-05-16から2025-07-24までの70本の期間は上昇基調（期間騰落率 +10.5%）。高値 3010.00 / 安値 2570.00、日次リターンのボラティリティ約1.20%。陽線 38本 / 陰線 32本。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+<|ts_pad|>×17
+context assets (1): BTC-USD
+<|ts_context_pad|>×24
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ETH-USD について、2025-05-16から2025-07-24までの70本の期間は上昇基調（期間騰落率 +10.1%）。高値 3824.00 / 安値 3170.00、日次リターンのボラティリティ約1.75%。陽線 37本 / 陰線 33本。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×77<|vision_end|><|vision_start|><|image_pad|>×70<|vision_end|>asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+context assets tile image (1, left-to-right top-to-bottom): BTC-USD
+<|ts_pad|>×17
+context assets (1): BTC-USD
+<|ts_context_pad|>×24
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ETH-USD について、2025-05-16から2025-07-24までの70本の期間は上昇基調（期間騰落率 +14.0%）。高値 3826.00 / 安値 3170.00、日次リターンのボラティリティ約1.45%。陽線 38本 / 陰線 32本。
+
+=== task: return_forecast ===
+ground truth: [FUTURE OUTCOME] ETH-USD: 直近終値 3708.01 を起点に、今後10本の期間で下落し、期間終値は 3497.38（騰落率 -5.7%）。期間中の最大値幅は上値 +6.3% / 下値 -9.4%。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×77<|vision_end|><|vision_start|><|image_pad|>×70<|vision_end|>asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+context assets tile image (1, left-to-right top-to-bottom): BTC-USD
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ETH-USD: 直近終値 278.00 を起点に、今後10本の期間で横ばいし、期間終値は 277.00（騰落率 -0.3%）。期間中の最大値幅は上値 +0.5% / 下値 -0.6%。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+<|ts_pad|>×17
+context assets (1): BTC-USD
+<|ts_context_pad|>×24
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ETH-USD: 直近終値 1800.00 を起点に、今後10本の期間で上昇し、期間終値は 1840.00（騰落率 +2.1%）。期間中の最大値幅は上値 +2.2% / 下値 -0.5%。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×77<|vision_end|><|vision_start|><|image_pad|>×70<|vision_end|>asset: ETH-USD
+period: 70 bars (2025-05-16 ~ 2025-07-24)
+context assets tile image (1, left-to-right top-to-bottom): BTC-USD
+<|ts_pad|>×17
+context assets (1): BTC-USD
+<|ts_context_pad|>×24
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ETH-USD: 直近終値 2025.00 を起点に、今後10本の期間で下落し、期間終値は 1980.00（騰落率 -2.2%）。期間中の最大値幅は上値 +0.5% / 下値 -2.4%。

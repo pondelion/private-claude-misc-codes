@@ -1,0 +1,72 @@
+ticker: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+
+=== task: description ===
+ground truth: [MOCK DESCRIPTION] DBA について、2025-09-04から2026-01-12までの90本の期間は下落基調（期間騰落率 -5.9%）。高値 28.01 / 安値 25.22、日次リターンのボラティリティ約0.76%。陽線 46本 / 陰線 44本。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|><|vision_start|><|image_pad|>×75<|vision_end|>asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+context assets tile image (6, left-to-right top-to-bottom): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] DBA について、2025-09-04から2026-01-12までの90本の期間は下落基調（期間騰落率 -1.5%）。高値 12.02 / 安値 11.20、日次リターンのボラティリティ約0.52%。陽線 45本 / 陰線 45本。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+<|ts_pad|>×22
+context assets (6): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_context_pad|>×24
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] DBA について、2025-09-04から2026-01-12までの90本の期間は下落基調（期間騰落率 -1.5%）。高値 12.70 / 安値 11.80、日次リターンのボラティリティ約0.65%。陽線 45本 / 陰線 45本。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|><|vision_start|><|image_pad|>×75<|vision_end|>asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+context assets tile image (6, left-to-right top-to-bottom): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_pad|>×22
+context assets (6): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_context_pad|>×24
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] DBA について、2025-09-04から2026-01-12までの90本の期間は下落基調（期間騰落率 -1.5%）。高値 12.50 / 安値 11.80、日次リターンのボラティリティ約0.55%。陽線 45本 / 陰線 45本。
+
+=== task: return_forecast ===
+ground truth: [FUTURE OUTCOME] DBA: 直近終値 25.63 を起点に、今後10本の期間で横ばいし、期間終値は 25.84（騰落率 +0.8%）。期間中の最大値幅は上値 +0.9% / 下値 -0.6%。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|><|vision_start|><|image_pad|>×75<|vision_end|>asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+context assets tile image (6, left-to-right top-to-bottom): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] DBA: 直近終値 12.02 を起点に、今後10本の期間で下落し、期間終値は 11.75（騰落率 -2.2%）。期間中の最大値幅は上値 +0.0% / 下値 -2.3%。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+<|ts_pad|>×22
+context assets (6): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_context_pad|>×24
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] DBA: 直近終値 10.01 を起点に、今後10本の期間で下落し、期間終値は 9.87（騰落率 -1.5%）。期間中の最大値幅は上値 +0.4% / 下値 -1.7%。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|><|vision_start|><|image_pad|>×75<|vision_end|>asset: DBA
+period: 90 bars (2025-09-04 ~ 2026-01-12)
+context assets tile image (6, left-to-right top-to-bottom): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_pad|>×22
+context assets (6): QQQ, ^SKEW, ^VVIX, UUP, TLT, SCHB
+<|ts_context_pad|>×24
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] DBA: 直近終値 17.02 を起点に、今後10本の期間で下落し、期間終値は 16.67（騰落率 -2.1%）。期間中の最大値幅は上値 +0.1% / 下値 -2.2%。

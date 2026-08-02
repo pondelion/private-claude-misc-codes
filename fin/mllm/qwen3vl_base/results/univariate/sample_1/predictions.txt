@@ -1,0 +1,60 @@
+ticker: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+
+=== task: description ===
+ground truth: [MOCK DESCRIPTION] ZB=F について、2025-07-08から2025-10-22までの76本の期間は上昇基調（期間騰落率 +5.5%）。高値 119.59 / 安値 111.34、日次リターンのボラティリティ約0.53%。陽線 41本 / 陰線 35本。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|>asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ZB=F について、2025-07-08から2025-10-22までの76本の期間は上昇基調（期間騰落率 +1.8%）。高値 102.00 / 安値 97.00、日次リターンのボラティリティ約0.36%。陽線 40本 / 陰線 36本。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+<|ts_pad|>×19
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ZB=F について、2025-07-08から2025-10-22までの76本の期間は上昇基調（期間騰落率 +1.8%）。高値 100.00 / 安値 95.00、日次リターンのボラティリティ約0.35%。陽線 41本 / 陰線 35本。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|>asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+<|ts_pad|>×19
+Describe this price chart.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [MOCK DESCRIPTION] ZB=F について、2025-07-08から2025-10-22までの76本の期間は上昇基調（期間騰落率 +1.8%）。高値 102.00 / 安値 97.00、日次リターンのボラティリティ約0.35%。陽線 41本 / 陰線 35本。
+
+=== task: return_forecast ===
+ground truth: [FUTURE OUTCOME] ZB=F: 直近終値 119.28 を起点に、今後10本の期間で下落し、期間終値は 116.44（騰落率 -2.4%）。期間中の最大値幅は上値 +0.1% / 下値 -2.5%。
+-- modality: image_only --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|>asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ZB=F: 直近終値 104.00 を起点に、今後10本の期間で上昇し、期間終値は 105.20（騰落率 +1.1%）。期間中の最大値幅は上値 +1.2% / 下値 -0.3%。
+-- modality: ts_only --
+[raw prompt] <|im_start|>user
+asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+<|ts_pad|>×19
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ZB=F: 直近終値 100.00 を起点に、今後10本の期間で上昇し、期間終値は 101.40（騰落率 +1.4%）。期間中の最大値幅は上値 +1.5% / 下値 -0.5%。
+-- modality: both --
+[raw prompt] <|im_start|>user
+<|vision_start|><|image_pad|>×72<|vision_end|>asset: ZB=F
+period: 76 bars (2025-07-08 ~ 2025-10-22)
+<|ts_pad|>×19
+Forecast how the price will move over the next 10 bars.<|im_end|>
+<|im_start|>assistant
+
+[generated]  [FUTURE OUTCOME] ZB=F: 直近終値 104.00 を起点に、今後10本の期間で横ばいし、期間終値は 103.80（騰落率 -0.2%）。期間中の最大値幅は上値 +0.3% / 下値 -0.3%。

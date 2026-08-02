@@ -1,0 +1,18 @@
+{
+  "n_steps": 1000,
+  "batch_size": 8,
+  "lr": 5e-05,
+  "horizon": 10,
+  "n_eval_samples": 1000,
+  "cutoff_date": "2024-06-01",
+  "lora_r": 16,
+  "n_result_samples": 3,
+  "results_dir": null,
+  "log_every": 20,
+  "load_in_8bit": false,
+  "grad_accum_steps": 1,
+  "max_grad_norm": 1.0,
+  "amp": true,
+  "attn_implementation": null,
+  "train_vision_projector": true
+}
