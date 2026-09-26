@@ -1,0 +1,28 @@
+[project]
+name = "speech-exp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "soundfile>=0.14.0",
+    "nemo-toolkit[asr]>=3.0.0",
+    "jiwer>=4.0.0",
+    "accelerate>=1.14.0",
+    "janome>=0.5.0",
+    "numba-cuda[cu13]>=0.30.4",
+    "moss-transcribe-diarize",
+    "gradio>=6.26.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+moss-transcribe-diarize = { git = "https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
