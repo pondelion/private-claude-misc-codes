@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-batched-image-aug"
+version = "0.1.0"
+description = "albumentations-like image augmentation executed on whole GPU batches with per-sample random parameters"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+test = ["albumentations>=2.0", "opencv-python", "numpy", "pytest"]
+
+[tool.setuptools.packages.find]
+include = ["gpu_batched_image_aug*"]
