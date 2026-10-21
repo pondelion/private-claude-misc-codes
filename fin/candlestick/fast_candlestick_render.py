@@ -7,9 +7,20 @@ def render_candlesticks(ohlc, width=224, height=224, candle_width=3, wick_width=
                          bull_color=(0.85, 0.15, 0.15),
                          bear_color=(0.15, 0.4, 0.85),
                          wick_tint=0.5,
-                         ma_windows=(), ma_series=None, ma_colors=None, ma_line_width=1):
+                         ma_windows=(), ma_series=None, ma_colors=None, ma_line_width=1,
+                         volume_height_ratio=0.25, volume_gap=1,
+                         volume_bull_color=(0.2, 0.8, 0.3), volume_bear_color=(0.6, 0.3, 0.9)):
     """
-    ohlc: (B, T, 4) tensor, last dim = [open, high, low, close]
+    ohlc: (B, T, 4) tensor, last dim = [open, high, low, close], or (B, T, 5) with volume as the last column.
+        With 5 columns, a volume bar panel is drawn separately and concatenated below the candlestick panel; the
+        returned image is still (height, width) in total (the candlestick panel gets the remaining rows).
+        With 4 columns the output is exactly the same as before (no volume panel).
+    volume_height_ratio: fraction of `height` used by the volume panel (only with 5 columns)
+    volume_gap: background rows at the top of the volume panel separating it from the candles (only with 5 columns)
+    volume_bull_color / volume_bear_color: RGB in [0, 1] of the volume bar for days with close >= open / close < open.
+        Deliberately different from the candle colors (default green / purple) so that bars are not mistaken for
+        candle bodies. Bars are scaled per sample by the max volume in the window (0 at the panel bottom);
+        volume <= 0 or nan draws no bar.
     bull_color / bear_color: RGB in [0, 1] for close >= open / close < open (JP convention: red up, blue down)
     wick_tint: how much to lighten the wick color relative to the body color, in [0, 1] (0 = same as body,
         1 = white). Gives the thin wick contrast against the wider body fill so it doesn't get visually lost.
@@ -23,6 +34,20 @@ def render_candlesticks(ohlc, width=224, height=224, candle_width=3, wick_width=
     ma_colors: RGB tuple per MA line (ma_series if given, else ma_windows); defaults to a fixed palette if None
     returns: (B, height, width, 3) RGB image tensor in [0, 1]
     """
+    n_cols = ohlc.shape[-1]
+    assert n_cols in (4, 5), f"ohlc last dim must be 4 (OHLC) or 5 (OHLCV), got {n_cols}"
+    if n_cols == 5:
+        vol_h = int(round(height * volume_height_ratio))
+        price_h = height - vol_h
+        assert price_h >= 2 and vol_h > volume_gap, "height too small for the volume panel; adjust volume_height_ratio / volume_gap"
+        price_img = render_candlesticks(ohlc[..., :4], width=width, height=price_h, candle_width=candle_width,
+                                        wick_width=wick_width, gap=gap, bg_color=bg_color, bull_color=bull_color,
+                                        bear_color=bear_color, wick_tint=wick_tint, ma_windows=ma_windows,
+                                        ma_series=ma_series, ma_colors=ma_colors, ma_line_width=ma_line_width)
+        vol_img = _render_volume_bars(ohlc, width, vol_h, candle_width, gap, bg_color, volume_gap,
+                                      volume_bull_color, volume_bear_color)
+        return torch.cat([price_img, vol_img], dim=1)
+
     B, T, _ = ohlc.shape
     device = ohlc.device
     step = candle_width + gap
@@ -93,6 +118,39 @@ def render_candlesticks(ohlc, width=224, height=224, candle_width=3, wick_width=
     return img
 
 
+def _render_volume_bars(ohlcv, width, height, candle_width, gap, bg_color, top_gap, bull_color, bear_color):
+    """
+    ohlcv: (B, T, 5) -> (B, height, width, 3) volume bar panel, bars at the same columns as the candle bodies.
+    Bar height = volume / max(volume in the window) * (height - top_gap), rounded; the top `top_gap` rows stay empty.
+    """
+    B, T, _ = ohlcv.shape
+    device, dtype = ohlcv.device, ohlcv.dtype
+    step = candle_width + gap
+    assert step * T <= width, "increase width or shrink candle_width/gap for this T"
+
+    o, c, v = ohlcv[..., 0], ohlcv[..., 3], ohlcv[..., 4]
+    v = torch.nan_to_num(v, nan=0.0).clamp_min(0.0)
+    vmax = v.max(dim=1, keepdim=True).values.clamp_min(1e-12)
+    bar_px = (v / vmax * (height - top_gap)).round().long()  # (B, T), 0 for volume 0
+    bar_top = height - bar_px  # first row of the bar (bar occupies rows [bar_top, height))
+
+    row_idx = torch.arange(height, device=device).view(1, height, 1)
+    bar_mask = (row_idx >= bar_top.unsqueeze(1)) & (bar_px.unsqueeze(1) > 0)  # (B,H,T)
+
+    bull_c = torch.tensor(bull_color, device=device, dtype=dtype)
+    bear_c = torch.tensor(bear_color, device=device, dtype=dtype)
+    bar_color = torch.where((c >= o).unsqueeze(-1), bull_c, bear_c)  # (B,T,3)
+    bar_color = bar_color.unsqueeze(1).expand(-1, height, -1, -1)  # (B,H,T,3)
+
+    bg_c = torch.tensor(bg_color, device=device, dtype=dtype)
+    img = bg_c.view(1, 1, 1, 3).expand(B, height, width, 3).clone()
+    col_start = torch.arange(T, device=device) * step
+    for dx in range(candle_width):
+        cols = col_start + dx
+        img[:, :, cols] = torch.where(bar_mask.unsqueeze(-1), bar_color, img[:, :, cols])
+    return img
+
+
 def _sma(close, window):
     """close: (B, T) -> (B, T) simple moving average, nan-padded for the first `window - 1` steps"""
     B, T = close.shape
@@ -150,6 +208,14 @@ def make_synthetic_ohlc(batch=4, length=60, seed=0):
     return torch.stack([o, h, l, c], dim=-1)
 
 
+def make_synthetic_volume(ohlc, seed=1):
+    """(B, T, 4) -> (B, T) synthetic volume: larger on days with a big open-close move, with random fluctuation"""
+    g = torch.Generator().manual_seed(seed)
+    o, c = ohlc[..., 0], ohlc[..., 3]
+    move = (c - o).abs() / (c - o).abs().mean(dim=1, keepdim=True).clamp_min(1e-8)
+    return (0.3 + move) * (0.5 + torch.rand(o.shape, generator=g)) * 1e6
+
+
 def rolling_mean_last_n(x, window, n):
     """x: (B, L) -> (B, n) SMA for the last n steps of x, using `window`-length lookback (needs L >= n + window - 1)"""
     B, L = x.shape
@@ -178,3 +244,11 @@ if __name__ == "__main__":
         Image.fromarray(arr).save(os.path.join(out_dir, f"candlestick_sample_{i}.png"))
 
     print(f"saved {imgs.shape[0]} images to {out_dir}")
+
+    # volume version: the same data as candlestick_sample_3 plus a volume column (5 columns -> volume bar panel below)
+    ohlcv = torch.cat([ohlc, make_synthetic_volume(ohlc)[..., None]], dim=-1)
+    imgs_v = render_candlesticks(ohlcv, width=240, height=160, candle_width=3, wick_width=1, gap=1,
+                                  ma_series=ma_series)
+    arr = (imgs_v[3].clamp(0, 1) * 255).byte().numpy()
+    Image.fromarray(arr).save(os.path.join(out_dir, "candlestick_sample_4.png"))
+    print(f"saved candlestick_sample_4.png (same data as sample_3 + volume) to {out_dir}")
