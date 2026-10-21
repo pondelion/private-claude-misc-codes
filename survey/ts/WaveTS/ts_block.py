@@ -27,10 +27,12 @@ def _haar_forward(x: torch.Tensor, levels: int):
             if low.size(-1) < 2:
                 raise ValueError("reflect Haar requires at least two samples per level")
             low = F.pad(low, (0, 1), mode="reflect")
+            # Odd L -> L+1, preserving the official reflected boundary.
         # Split adjacent time samples: [B,C,T] -> two [B,C,T/2] bands.
         even, odd = low[..., ::2], low[..., 1::2]
         highs.append((even - odd) / math.sqrt(2))
         low = (even + odd) / math.sqrt(2)
+        # Detail and new low are each [B,C,ceil(L/2)].
     return low, highs, lengths
 
 
@@ -88,7 +90,10 @@ class WaveTSBlock(nn.Module):
                 'positive dimensions/levels and nonempty orders required')
         if any(not isinstance(k, int) or k < 1 for k in orders):
             raise ValueError('orders must be positive integers')
-        self.in_dim, self.out_dim, self.seq_len, self.levels = in_dim, out_dim, seq_len, levels
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.seq_len = seq_len
+        self.levels = levels
         self.orders = tuple(orders)
         self.frus = nn.ModuleList(FRU(seq_len, levels) for _ in orders)
         # Official projection_time mixes the order axis after concatenating
@@ -99,19 +104,22 @@ class WaveTSBlock(nn.Module):
         self.output = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> [B,T,Cout], T fixed by coefficient readouts."""
         if x.ndim != 3 or x.shape[1] != self.seq_len or x.shape[
                 2] != self.in_dim:
             raise ValueError(f'expected [B,{self.seq_len},{self.in_dim}]')
         # Official non-stationary normalization: mean is detached, variance
         # uses population denominator and remains on the autograd path.
-        mean = x.mean(1, keepdim=True).detach()
+        mean = x.mean(1, keepdim=True).detach()  # [B,1,Cin]
         centered = x - mean
         std = torch.sqrt(centered.var(1, keepdim=True, unbiased=False) + 1e-5)
-        normed = (centered / std).transpose(1, 2)  # [B,C,L]
+        normed = rearrange(centered / std, "b t c -> b c t")
+        # [B,T,Cin] -> [B,Cin,T]; std:[B,1,Cin].
         branches = []
         for order, fru in zip(self.orders, self.frus):
             # Each order has its own learned FRU; wavelet analysis is shared.
             low, highs, lengths = _haar_forward(normed, self.levels)
+            # low:[B,Cin,L_J], highs:[B,Cin,L_1] ... [B,Cin,L_J].
             low_factor = (-1)**order * 2.0**(order * self.levels)
             factors = [(-1)**order * 2.0**(order * (j + 1))
                        for j in range(self.levels)]
@@ -120,10 +128,13 @@ class WaveTSBlock(nn.Module):
             reconstruction = _haar_inverse(
                 low / low_factor, [h / f for h, f in zip(highs, factors)],
                 lengths)
-            branches.append(reconstruction.transpose(1, 2))  # each [B,L,C]
-        ordered = torch.cat(branches, dim=1).transpose(1, 2)  # [B,C,O*L]
-        prediction = self.projection_time(ordered).transpose(1, 2)  # [B,L,C]
-        return self.output(prediction * std + mean)
+            branches.append(rearrange(reconstruction, "b c t -> b t c"))
+            # Each order reconstructs [B,Cin,T] -> [B,T,Cin].
+        ordered = rearrange(torch.cat(branches, dim=1),
+                            "b t c -> b c t")  # [B,Cin,O*T]
+        prediction = rearrange(self.projection_time(ordered),
+                               "b c t -> b t c")  # [B,T,Cin]
+        return self.output(prediction * std + mean)  # [B,T,Cout].
 
 
 if __name__ == '__main__':

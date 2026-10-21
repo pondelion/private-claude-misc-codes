@@ -49,7 +49,7 @@ class TQNetBlock(nn.Module):
         """Return official pre-head representation [B,Cin,D]."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError(f"expected [B,{self.seq_len},{self.in_dim}]")
-        batch = x.shape[0]
+        batch = x.shape[0]  # B; input axes are [B,T,Cin].
         if phase is None:
             # A zero origin is meaningful only when each window begins at
             # phase zero. Pass measured phases for genuine periodic data.
@@ -59,27 +59,30 @@ class TQNetBlock(nn.Module):
         phase = phase.to(device=x.device, dtype=torch.long)
         if self.use_norm:
             # Match official torch.var default (sample variance, unbiased).
-            mean = x.mean(dim=1, keepdim=True)
+            mean = x.mean(dim=1, keepdim=True)  # [B,1,Cin]
             std = torch.sqrt(x.var(dim=1, keepdim=True) + 1e-5)
-            x = (x - mean) / std
+            x = (x - mean) / std  # [B,T,Cin]
         histories = rearrange(x, "b t c -> b c t")  # [B,C,T]
+        # [B,1]+[1,T] -> [B,T] periodic row indices.
         positions = (phase[:, None] + torch.arange(
             self.seq_len, device=x.device)[None, :]) % self.cycle_len
         queries = rearrange(self.temporal_query[positions],
                             "b t c -> b c t")  # [B,C,T]
         information, _ = self.channel_attention(
             queries, histories, histories, need_weights=False)
+        # Q,K,V:[B,Cin,T] -> attention over Cin -> [B,Cin,T].
         # [B,C,T] -> [B,C,D]; model MLP and residual match official order.
         embedded = self.input_proj(histories + information)
-        return embedded + self.model(embedded)
+        return embedded + self.model(embedded)  # [B,Cin,D]
 
     def forward(self, x: torch.Tensor,
                 phase: torch.Tensor | None = None) -> torch.Tensor:
         # [B,C,D] -> [B,C,T] -> [B,T,C] -> [B,T,Cout]. The official
         # de-normalization is part of its forecasting head, not this encoder.
         tokens = self.forward_features(x, phase)
+        # Learned same-length adapter: [B,Cin,D] -> [B,Cin,T] -> [B,T,Cin].
         series = rearrange(self.time_readout(tokens), "b c t -> b t c")
-        return self.output(series)
+        return self.output(series)  # [B,T,Cout], including Cin=Cout.
 
 
 if __name__ == "__main__":

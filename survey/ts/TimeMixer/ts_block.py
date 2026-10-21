@@ -18,7 +18,8 @@ def moving_average(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
     pad = (kernel_size - 1) // 2
     extended = torch.cat(
         (x[:, :1].expand(-1, pad, -1), x, x[:, -1:].expand(-1, pad, -1)),
-        dim=1)
+        dim=1)  # [B,T+2*pad,D]
+    # Pool1d expects [B,D,T+2*pad]; returning [B,T,D].
     return rearrange(
         F.avg_pool1d(rearrange(extended, "b t d -> b d t"),
                      kernel_size,
@@ -53,6 +54,7 @@ class PastDecomposableMixing(nn.Module):
                                              nn.Linear(d_ff, d_model))
 
     def forward(self, scales: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Each [B,T_i,D] -> [B,T_i,D], fine-to-coarse season and reverse trend."""
         if len(scales) != len(self.lengths):
             raise ValueError("unexpected number of scales")
         seasons, trends = [], []
@@ -66,21 +68,25 @@ class PastDecomposableMixing(nn.Module):
                     trend)
             seasons.append(rearrange(season, "b t d -> b d t"))
             trends.append(rearrange(trend, "b t d -> b d t"))
+            # [B,T_i,D] -> [B,D,T_i] for temporal Linear(T_i,T_j).
 
         # Fine -> coarse. The time-MLP maps T_i to T_(i+1).
         mixed_season = [seasons[0]]
         for i, layer in enumerate(self.season_down):
             mixed_season.append(seasons[i + 1] + layer(mixed_season[-1]))
+            # [B,D,T_i] -> [B,D,T_(i+1)] before adding coarse season.
 
         # Coarse -> fine. Reversed layer order matches the official code.
         mixed_trend = [None] * len(trends)
         mixed_trend[-1] = trends[-1]
         for layer, i in zip(self.trend_up, range(len(trends) - 2, -1, -1)):
             mixed_trend[i] = trends[i] + layer(mixed_trend[i + 1])
+            # [B,D,T_(i+1)] -> [B,D,T_i] before adding finer trend.
 
         outputs = []
         for original, season, trend in zip(scales, mixed_season, mixed_trend):
             out = rearrange(season + trend, "b d t -> b t d")
+            # [B,D,T_i] -> [B,T_i,D].
             if self.channel_independence:
                 out = original + self.out_cross_layer(out)
             outputs.append(out)  # each [B,T_i,D]
@@ -164,16 +170,19 @@ class TimeMixerBlock(nn.Module):
         scales = [x]
         for _ in range(len(self.pdm_blocks[0].lengths) - 1):
             source = rearrange(scales[-1], "b t c -> b c t")
+            # [B,T_i,Cin] -> [B,Cin,T_i] for temporal downsampling.
             if self.method == "avg":
                 reduced = F.avg_pool1d(source, self.window)
             else:
                 reduced = F.max_pool1d(source, self.window)
             scales.append(rearrange(reduced, "b c t -> b t c"))
+            # [B,Cin,T_(i+1)] -> [B,T_(i+1),Cin].
 
         embedded = []
         for index, scale in enumerate(scales):
             if self.use_norm:
                 mean = scale.mean(dim=1, keepdim=True).detach()
+                # mean/stdev:[B,1,Cin], computed separately at each scale.
                 stdev = (scale.var(dim=1, keepdim=True, unbiased=False) +
                          1e-5).sqrt().detach()
                 scale = (scale - mean) / stdev
@@ -185,11 +194,14 @@ class TimeMixerBlock(nn.Module):
                 scale = scale - moving_average(scale, self.moving_avg)
             if self.channel_independence:
                 tokens = rearrange(scale, "b t c -> (b c) 1 t")
+                # CI=True: [B,T_i,Cin] -> [B*Cin,1,T_i].
             else:
                 tokens = rearrange(scale, "b t c -> b c t")
+                # CI=False: [B,T_i,Cin] -> [B,Cin,T_i], fused by Conv1d.
             encoded = self.embedding(tokens)  # [B or B*Cin,D,T_i]
             embedded.append(
                 self.embed_dropout(rearrange(encoded, "b d t -> b t d")))
+            # [B or B*Cin,D,T_i] -> [B or B*Cin,T_i,D].
         for block in self.pdm_blocks:
             embedded = block(embedded)
         finest = embedded[0]  # [B or B*Cin,T,D]
@@ -198,8 +210,10 @@ class TimeMixerBlock(nn.Module):
                                "(b c) t d -> b t (c d)",
                                b=batch,
                                c=self.in_dim)
+            # [B*Cin,T,D] -> [B,T,Cin*D]; no early series fusion.
         return finest
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> [B,T,Cout]; the output Linear is task adapter."""
         finest = self.forward_features(x)
         return self.output(finest)  # [B,T,Cout]

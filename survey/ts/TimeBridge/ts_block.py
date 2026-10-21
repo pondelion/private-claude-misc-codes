@@ -40,11 +40,14 @@ class TSMixer(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor,
                 v: torch.Tensor) -> torch.Tensor:
+        """Q:[B,Lq,D], K/V:[B,Lk,D] -> [B,Lq,D]."""
         q = rearrange(self.q_proj(q), "b n (h d) -> b h n d", h=self.heads)
         k = rearrange(self.k_proj(k), "b n (h d) -> b h n d", h=self.heads)
         v = rearrange(self.v_proj(v), "b n (h d) -> b h n d", h=self.heads)
         scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+        # [B,H,Lq,Lk]; softmax selects among Lk key tokens.
         weighted = self.dropout(scores.softmax(dim=-1)) @ v
+        # [B,H,Lq,D/H] -> combine heads [B,Lq,D].
         return self.out(rearrange(weighted, "b h n d -> b n (h d)"))
 
 
@@ -62,6 +65,7 @@ class _FeedForward(nn.Module):
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def finish(self, x: torch.Tensor, attended: torch.Tensor) -> torch.Tensor:
+        """Post-norm residual + FFN, preserving x's [B,C,N,D] axes."""
         x = self.norm1(x + self.dropout(attended))
         y = self.dropout(self.activation(self.fc1(x)))
         return self.norm2(x + self.dropout(self.fc2(y)))
@@ -77,11 +81,14 @@ class IntegratedAttention(_FeedForward):
         self.stable_len = stable_len
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, channels, patches, dim = x.shape
+        """Within-series patch attention: [B,C,N,D] -> [B,C,N,D]."""
+        batch, channels, _, _ = x.shape
         flat = rearrange(x, "b c n d -> (b c) n d")
+        # [B,C,N,D] -> [B*C,N,D]; no cross-series mixing in this stage.
         with torch.no_grad():
             stable = period_norm(flat, self.stable_len)
         attended = self.attention(stable, stable, flat)
+        # Q/K stationary, V original; all [B*C,N,D].
         return self.finish(x, rearrange(attended,
                                         "(b c) n d -> b c n d", b=batch,
                                         c=channels))
@@ -101,19 +108,24 @@ class PatchSampling(_FeedForward):
         self.attention = TSMixer(dim, heads, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Cross-attend N source patches into M reduced patches per series."""
         batch, channels, _, _ = x.shape
         flat = rearrange(x, "b c n d -> (b c) n d")
-        reduced = self.conv1(flat)
+        # [B,C,N,D] -> [B*C,N,D]; Conv1d treats N as input channels.
+        reduced = self.conv1(flat)  # [B*C,M,D]
+        # Append global mean [B*C,1,D], then restore M query patches.
         reduced = self.conv2(torch.cat((reduced, flat.mean(-2,
                                     keepdim=True)), dim=-2)) + reduced
         # Released down_attn adds dropout(reduced) to attention output.
         attended = self.attention(reduced, flat, flat) + self.dropout(reduced)
+        # Q:[B*C,M,D], K/V:[B*C,N,D] -> [B*C,M,D].
         attended = rearrange(attended, "(b c) n d -> b c n d",
                              b=batch, c=channels)
         # PatchSampling does not add the original x: patch count changed.
         y = self.norm1(attended)
-        z = self.dropout(self.activation(self.fc1(y)))
-        return self.norm2(y + self.dropout(self.fc2(z)))
+        expanded_features = self.dropout(self.activation(self.fc1(y)))
+        # [B,C,M,D] -> [B,C,M,Dff] -> [B,C,M,D].
+        return self.norm2(y + self.dropout(self.fc2(expanded_features)))
 
 
 class CointegratedAttention(_FeedForward):
@@ -129,17 +141,22 @@ class CointegratedAttention(_FeedForward):
         self.attention2 = TSMixer(dim, heads, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, channels, patches, dim = x.shape
+        """Across-series attention: [B,C,M,D] -> [B,C,M,D]."""
+        batch, channels, patches, _ = x.shape
         flat = rearrange(x, "b c n d -> (b n) c d")
+        # [B,C,M,D] -> [B*M,C,D]; each patch position attends across C.
         if self.axial:
             # Pad C+4 channels to R². The source partitions padded tokens
             # into R rows, attends within rows, transposes, then attends rows.
             side = self.num_rc
             padded = F.pad(flat.transpose(-1, -2),
                            (0, side * side - channels)).transpose(-1, -2)
+            # [B*M,C,D] -> [B*M,R²,D], R=ceil(sqrt(C)).
             rows = rearrange(padded, "bn (r c) d -> (bn r) c d", r=side)
+            # [B*M,R²,D] -> [B*M*R,R,D]; first attention over each row.
             rows = self.attention1(rows, rows, rows)
             cols = rearrange(rows, "(bn r) c d -> (bn c) r d", r=side)
+            # [B*M*R,R,D]; transpose grid to attend its columns.
             cols = self.attention2(cols, cols, cols) + cols
             attended = rearrange(cols,
                                   "(b n c) r d -> b (r c) n d",
@@ -209,20 +226,25 @@ class TimeBridgeBlock(nn.Module):
             mean = x.mean(1, keepdim=True).detach()
             std = x.std(1, keepdim=True).detach()
             x = (x - mean) / (std + 1e-5)
-        joined = torch.cat((x, markers), dim=-1)
+        joined = torch.cat((x, markers), dim=-1)  # [B,T,Cin+4]
         patches = rearrange(joined, "b (n p) c -> b c n p", p=self.period)
+        # [B,T,Cin+4] -> [B,Cin+4,N,P], N=T/P.
         tokens = self.embedding_dropout(self.embedding(patches))
+        # Shared patch Linear(P,D): [B,Cin+4,N,D].
         for layer in self.layers:
             tokens = layer(tokens)
         return tokens
 
     def forward(self, x: torch.Tensor,
                 markers: torch.Tensor | None = None) -> torch.Tensor:
+        """[B,T,Cin] -> downstream features [B,T,Cout]."""
         encoded = self.forward_features(x, markers)[:, :self.in_dim]
+        # [B,Cin+4,M,D] -> data tokens only [B,Cin,M,D].
         flattened = rearrange(encoded, "b c n d -> b c (n d)")
+        # [B,Cin,M,D] -> [B,Cin,M*D].
         series = rearrange(self.time_readout(flattened),
-                           "b c t -> b t c")
-        return self.output(series)
+                           "b c t -> b t c")  # [B,T,Cin]
+        return self.output(series)  # [B,T,Cout].
 
 
 if __name__ == "__main__":

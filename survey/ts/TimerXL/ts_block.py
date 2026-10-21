@@ -38,14 +38,17 @@ class TimeAttention(nn.Module):
 
     @staticmethod
     def _rotate(x: torch.Tensor) -> torch.Tensor:
+        """Rotate adjacent pairs without changing the input tensor shape."""
         pairs = rearrange(x, "... (d two) -> ... d two", two=2)
         rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1)
         return rearrange(rotated, "... d two -> ... (d two)")
 
     def _partial_rotary(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,H,C*N,D/H] -> same; rotate first half of head width."""
         # Official QK projection rotates the first HALF of each head's D/H.
         width = x.shape[-1] // 2
         rotating, unchanged = x[..., :width], x[..., width:]
+        # Both keep [B,H,C*N,*]; widths sum to the original D/H.
         positions = torch.arange(x.shape[-2], device=x.device,
                                  dtype=torch.float32)
         theta = 1.0 / torch.pow(
@@ -53,6 +56,7 @@ class TimeAttention(nn.Module):
             torch.arange(0, width, 2, device=x.device,
                          dtype=torch.float32) / width)
         angles = positions[:, None] * theta[None, :]
+        # [C*N,width/2] -> [C*N,width], matching adjacent feature pairs.
         angles = torch.repeat_interleave(angles, 2, dim=-1)
         rotated = (rotating * angles.cos()[None, None] +
                    self._rotate(rotating) * angles.sin()[None, None])
@@ -60,6 +64,7 @@ class TimeAttention(nn.Module):
 
     def _mask(self, channels: int, patches: int,
               device: torch.device) -> torch.Tensor:
+        """Return forbidden key positions [C*N,C*N] for each query."""
         ids = torch.arange(channels * patches, device=device)
         var = ids // patches
         time = ids % patches
@@ -75,6 +80,7 @@ class TimeAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, channels: int,
                 patches: int) -> torch.Tensor:
+        """[B,C*N,D] -> [B,C*N,D], attending to allowed patch times."""
         if x.shape[1] != channels * patches:
             raise ValueError("token count must equal channels * patches")
         # [B,C*N,D] -> [B,H,C*N,D/H]. RoPE uses flattened token index,
@@ -88,6 +94,7 @@ class TimeAttention(nn.Module):
             patches)
         same = (var_id[:, None] == var_id[None, :]).long()
         bias = rearrange(self.binary_bias(same), "q k h -> h q k")
+        # same:[C*N,C*N], bias:[H,C*N,C*N].
         # OpenLTM non-flash code scales scores+binary bias together.
         scores = (q @ k.transpose(-2, -1) + bias[None]) * (
             q.shape[-1] ** -0.5)
@@ -95,7 +102,9 @@ class TimeAttention(nn.Module):
             self._mask(channels, patches, x.device)[None, None],
             float("-inf"))
         weights = self.attention_dropout(scores.softmax(dim=-1))
+        # weights:[B,H,C*N,C*N] × V:[B,H,C*N,D/H].
         fused = rearrange(weights @ v, "b h n d -> b n (h d)")
+        # [B,H,C*N,D/H] -> [B,C*N,D].
         return self.output(fused)
 
 
@@ -118,11 +127,14 @@ class TimerLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, channels: int,
                 patches: int) -> torch.Tensor:
+        """[B,C*N,D] -> same after attention and per-token FFN."""
         x = self.norm1(x + self.dropout(
             self.attention(x, channels, patches)))
-        y = rearrange(x, "b n d -> b d n")
+        y = rearrange(x, "b n d -> b d n")  # [B,D,C*N]
         y = self.dropout(self.activation(self.conv1(y)))
+        # Conv1d kernel=1: [B,D,C*N] -> [B,Dff,C*N].
         y = self.dropout(rearrange(self.conv2(y), "b d n -> b n d"))
+        # Conv2 returns [B,D,C*N], rearranged to [B,C*N,D].
         return self.norm2(x + y)
 
 
@@ -161,26 +173,30 @@ class TimerXLBlock(nn.Module):
         if x.ndim != 3 or x.shape[-1] != self.in_dim or x.shape[1] % self.patch_len:
             raise ValueError("expected [B,T,Cin] with T divisible by patch_len")
         if self.use_norm:
-            mean = x.mean(1, keepdim=True).detach()
+            mean = x.mean(1, keepdim=True).detach()  # [B,1,Cin]
             centered = x - mean
             std = torch.sqrt(centered.var(1, keepdim=True,
                                           unbiased=False) + 1e-5)
-            x = centered / std
+            x = centered / std  # [B,T,Cin], std:[B,1,Cin]
         patches = rearrange(x, "b (n p) c -> b c n p", p=self.patch_len)
+        # [B,T,Cin] -> [B,Cin,N,P], N=T/P, P=patch length.
         count = patches.shape[2]
         tokens = rearrange(self.embedding(patches),
                            "b c n d -> b (c n) d")
+        # Shared Linear(P,D): [B,Cin,N,D] -> [B,Cin*N,D].
         for layer in self.layers:
             tokens = layer(tokens, self.in_dim, count)
         return self.norm(tokens)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> downstream features [B,T,Cout]."""
         tokens = self.forward_features(x)
         count = x.shape[1] // self.patch_len
         patches = rearrange(self.time_readout(tokens),
                             "b (c n) p -> b (n p) c", c=self.in_dim,
                             n=count)
-        return self.output(patches)
+        # [B,Cin*N,D] -> [B,Cin*N,P] -> [B,T,Cin].
+        return self.output(patches)  # [B,T,Cout].
 
 
 if __name__ == "__main__":

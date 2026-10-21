@@ -32,14 +32,19 @@ class ResidualPatchAttention(nn.Module):
     def forward(self, x: torch.Tensor,
                 previous: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Patch tokens [B*Cin,N,D] -> values [B*Cin,N,D], logits
+        [B*Cin,H,N,N]; H=head count, N=patch positions.
+        """
         # [B*C,N,D] -> [B*C,H,N,D/H]; attention only within each channel.
         q = rearrange(self.query(x), "b n (h d) -> b h n d", h=self.heads)
         k = rearrange(self.key(x), "b n (h d) -> b h n d", h=self.heads)
         v = rearrange(self.value(x), "b n (h d) -> b h n d", h=self.heads)
         logits = (q @ k.transpose(-2, -1)) * self.scale
+        # [B*Cin,H,N,N]; previous layer logits have the same axes.
         if previous is not None:
             logits = logits + previous
         weights = self.attention_dropout(logits.softmax(dim=-1))
+        # [B*Cin,H,N,N] @ [B*Cin,H,N,D/H] -> [B*Cin,N,D].
         value = rearrange(weights @ v, "b h n d -> b n (h d)")
         return self.output(value), logits
 
@@ -65,12 +70,14 @@ class PatchEncoderLayer(nn.Module):
     @staticmethod
     def _norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if isinstance(norm, nn.BatchNorm1d):
+            # BatchNorm1d expects [B*Cin,D,N], not token-last [B*Cin,N,D].
             return rearrange(norm(rearrange(x, "b n d -> b d n")),
                              "b d n -> b n d")
         return norm(x)
 
     def forward(self, x: torch.Tensor, previous: torch.Tensor | None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
+        """[B*Cin,N,D] -> same; carry score [B*Cin,H,N,N]."""
         attended, scores = self.attention(x, previous)
         x = self._norm(self.norm_attn, x + self.dropout_attn(attended))
         x = self._norm(self.norm_ffn, x + self.dropout_ffn(self.ff(x)))
@@ -127,6 +134,7 @@ class PatchTSTBlock(nn.Module):
     def _normalize(self, x: torch.Tensor) -> tuple[torch.Tensor,
                                                     torch.Tensor,
                                                     torch.Tensor]:
+        """[B,T,Cin] -> normalized [B,T,Cin], mean/std [B,1,Cin]."""
         mean = x.mean(1, keepdim=True).detach()
         std = torch.sqrt(x.var(1, keepdim=True, unbiased=False)
                          + 1e-5).detach()
@@ -136,17 +144,22 @@ class PatchTSTBlock(nn.Module):
         return x, mean, std
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        # [B,T,C] -> [B,C,T] -> [B,C,N,P] -> [B*C,N,D].
+        """[B,T,Cin] -> channel-independent patch tokens [B,Cin,D,N]."""
+        # [B,T,Cin] -> [B,Cin,T]; channels are separate processing streams.
         x = rearrange(x, "b t c -> b c t")
         if self.padding_patch == "end":
             x = F.pad(x, (0, self.stride), mode="replicate")
+            # [B,Cin,T] -> [B,Cin,T+stride].
         patches = x.unfold(-1, self.patch_len, self.stride)
-        embedded = self.embedding(patches)
+        # [B,Cin,T(+stride)] -> [B,Cin,N,P]; N=patch count, P=patch_len.
+        embedded = self.embedding(patches)  # [B,Cin,N,D]
         tokens = rearrange(embedded, "b c n d -> (b c) n d")
+        # [B,Cin,N,D] -> [B*Cin,N,D]; no cross-series attention.
         tokens = self.dropout(tokens + self.position)
         scores = None
         for layer in self.layers:
             tokens, scores = layer(tokens, scores)
+        # [B*Cin,N,D] -> official backbone boundary [B,Cin,D,N].
         return rearrange(tokens, "(b c) n d -> b c d n", c=self.in_dim)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -158,6 +171,7 @@ class PatchTSTBlock(nn.Module):
         return self._encode(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> same-length task features [B,T,Cout]."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError(f"expected [B,{self.seq_len},{self.in_dim}]")
         if self.revin:
@@ -165,15 +179,16 @@ class PatchTSTBlock(nn.Module):
         else:
             normalized = x
         features = self._encode(normalized)  # [B,C,D,N]
+        # [B,Cin,D,N] -> [B,Cin,D*N] -> [B,Cin,T].
         values = self.time_readout(rearrange(features,
                                              "b c d n -> b c (d n)"))
-        values = rearrange(values, "b c t -> b t c")
+        values = rearrange(values, "b c t -> b t c")  # [B,T,Cin]
         if self.revin:
             if self.affine:
                 values = (values - self.affine_bias) / (
                     self.affine_weight + 1e-10)
             values = values * std + mean
-        return self.output(values)
+        return self.output(values)  # [B,T,Cout], even when Cin=Cout.
 
 
 if __name__ == "__main__":

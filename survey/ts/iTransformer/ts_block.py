@@ -35,6 +35,7 @@ class VariateAttention(nn.Module):
         k = rearrange(self.key(x), "b c (h d) -> b h c d", h=self.heads)
         v = rearrange(self.value(x), "b c (h d) -> b h c d", h=self.heads)
         scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+        # scores/weights:[B,H,C,C]; softmax selects key series for each query.
         weights = self.attention_dropout(scores.softmax(dim=-1))
         # [B,H,C,C] @ [B,H,C,D/H] -> [B,C,D].
         fused = rearrange(weights @ v, "b h c d -> b c (h d)")
@@ -58,11 +59,13 @@ class InvertedEncoderLayer(nn.Module):
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,C,D] -> [B,C,D]; C=series tokens, D=latent width."""
         x = self.norm1(x + self.dropout(self.attention(x)))
         # Conv1d acts on feature D, independently at each variate token C.
-        y = rearrange(x, "b c d -> b d c")
-        y = self.dropout(self.activation(self.conv1(y)))
+        y = rearrange(x, "b c d -> b d c")  # [B,D,C]
+        y = self.dropout(self.activation(self.conv1(y)))  # [B,Dff,C]
         y = self.dropout(rearrange(self.conv2(y), "b d c -> b c d"))
+        # Conv2 restores [B,D,C], rearrange restores [B,C,D].
         return self.norm2(x + y)
 
 
@@ -96,6 +99,7 @@ class ITransformerBlock(nn.Module):
         self.output = nn.Linear(in_dim, out_dim)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> official encoder tokens [B,Cin,D]."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError(f"expected [B,{self.seq_len},{self.in_dim}]")
         if self.use_norm:
@@ -113,6 +117,7 @@ class ITransformerBlock(nn.Module):
         return self.norm(tokens)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> same-length downstream features [B,T,Cout]."""
         # [B,C,D] -> [B,C,T] -> [B,T,C] -> [B,T,Cout]. The output Linear
         # deliberately mixes variates even when Cin == Cout.
         tokens = self.forward_features(x)

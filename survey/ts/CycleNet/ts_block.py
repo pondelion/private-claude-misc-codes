@@ -17,9 +17,11 @@ class RecurrentCycle(nn.Module):
         self.data = nn.Parameter(torch.zeros(cycle_len, channels))
 
     def forward(self, phase: torch.Tensor, length: int) -> torch.Tensor:
+        """[B] start phases -> [B,T,C] periodic values; T=length."""
         if phase.ndim != 1 or length < 1:
             raise ValueError("phase must be [B], length must be positive")
-        offsets = torch.arange(length, device=phase.device)
+        offsets = torch.arange(length, device=phase.device)  # [T]
+        # Broadcast [B,1]+[1,T] -> [B,T] cycle-table row indices.
         indices = (phase.long()[:, None] + offsets[None, :]) % self.cycle_len
         return self.data[indices]  # [B,T,C]
 
@@ -66,6 +68,7 @@ class CycleNetBlock(nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 phase: torch.Tensor | None = None) -> torch.Tensor:
+        """[B,T,Cin] and start phase [B] -> [B,T,Cout]."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError("x must have shape [B,seq_len,in_dim]")
         batch = x.size(0)
@@ -85,12 +88,15 @@ class CycleNetBlock(nn.Module):
             x = (x - mean) / scale  # [B,T,Cin]
 
         input_cycle = self.cycle(phase, self.seq_len)  # [B,T,Cin]
+        # Subtract periodic template, then expose time to shared Linear:
+        # [B,T,Cin] -> [B,Cin,T]; C is independent until output Linear.
         residual = rearrange(x - input_cycle, "b t c -> b c t")
         mixed = self.temporal(residual)  # [B,Cin,T]
         # Match official Model.forward even when T is not a multiple of W.
         # The predicted horizon is T in this encoder adaptation.
         future_phase = (phase + self.seq_len) % self.cycle.cycle_len
-        output_cycle = self.cycle(future_phase, self.seq_len)
+        output_cycle = self.cycle(future_phase, self.seq_len)  # [B,T,Cin]
+        # [B,Cin,T] -> [B,T,Cin], then restore next-window cycle.
         restored = rearrange(mixed, "b c t -> b t c") + output_cycle
         if self.use_revin:
             restored = restored * scale + mean  # [B,T,Cin]

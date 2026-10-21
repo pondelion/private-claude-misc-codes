@@ -27,7 +27,9 @@ def haar_decompose(x: torch.Tensor, levels: int):
         lengths.append(low.size(-1))
         if low.size(-1) % 2:
             low = F.pad(low, (0, 1), mode="constant", value=0.0)
+            # Odd coefficient length L -> L+1 before even/odd splitting.
         even, odd = low[..., ::2], low[..., 1::2]
+        # Each [B,C,ceil(L/2)]; low/detail retain independent frequency bands.
         details.append((even - odd) / root2)
         low = (even + odd) / root2
     return low, details, lengths
@@ -42,6 +44,7 @@ def haar_reconstruct(low: torch.Tensor, details: list[torch.Tensor],
         odd = (low - detail) / root2
         low = rearrange(torch.stack((even, odd), dim=-1),
                         "b c t pair -> b c (t pair)")
+        # [B,C,L,2] -> [B,C,2L] -> original length after boundary trim.
         low = low[..., :original_length]
     return low
 
@@ -62,6 +65,7 @@ def haar_reconstruct_official(low: torch.Tensor,
         odd = (low - detail) / root2
         low = rearrange(torch.stack((even, odd), dim=-1),
                         "b c t pair -> b c (t pair)")
+        # [B,C,L,2] -> [B,C,2L]; caller keeps requested trailing T points.
     return low
 
 
@@ -82,9 +86,10 @@ class _Mixer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,C,N,D] -> [B,C,N,D]; N=patches, D=embedding width."""
         # [B,C,N,D] -> [B,D,C,N] so Linear mixes patch positions N.
         tokens = rearrange(self.norm1(x), "b c n d -> b d c n")
-        tokens = self.token(tokens)
+        tokens = self.token(tokens)  # [B,D,C,N] -> same; mixes patch N.
         x = rearrange(self.dropout(tokens), "b d c n -> b c n d")
         x = self.norm2(x)  # [B,C,N,D]
         return x + self.dropout(self.embedding(x))  # [B,C,N,D]
@@ -117,6 +122,7 @@ class ResolutionBranch(nn.Module):
         self.readout = nn.Linear(self.patch_count * d_model, length)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """One wavelet band [B,C,L] -> same length after patch mixers."""
         if x.size(-1) != self.length:
             raise ValueError("coefficient length differs from construction")
         # Per-band RevIN, following the official ResolutionBranch.  Statistics
@@ -130,15 +136,19 @@ class ResolutionBranch(nn.Module):
         if self.length < self.patch_len:
             normalized = F.pad(normalized, (0, self.patch_len - self.length),
                                mode="replicate")
+            # [B,C,L] -> [B,C,P] if the coefficient band is shorter than P.
         normalized = F.pad(normalized, (0, self.patch_stride),
                            mode="replicate")
+        # [B,C,max(L,P)] -> [B,C,max(L,P)+stride].
         patches = normalized.unfold(-1, self.patch_len, self.patch_stride)
+        # [B,C,padded_length] -> [B,C,N,P], N=self.patch_count.
         # [B,C,N,P] -> [B,C,N,D]; BN acts across batch and patch axes.
         embedded = self.embed_dropout(
             self.patch_embed(self.patch_norm(patches)))
         out = self.mixer1(embedded)
         out = self.norm(out + self.mixer2(out))  # [B,C,N,D]
         flat = rearrange(out, "b c n d -> b c (n d)")
+        # [B,C,N,D] -> [B,C,N*D] for per-band time readout.
         predicted = self.readout(flat)  # [B,C,L]
         predicted = ((predicted - self.affine_bias[None, :, None]) /
                      (self.affine_weight[None, :, None] + 1e-10))
@@ -187,6 +197,7 @@ class WPMixerBlock(nn.Module):
         self.output = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> same-length [B,T,Cout] with late series fusion."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError("x must have shape [B,seq_len,in_dim]")
         mean = x.mean(dim=1, keepdim=True).detach()  # [B,1,Cin]
@@ -197,6 +208,7 @@ class WPMixerBlock(nn.Module):
                       self.input_affine_bias)  # [B,T,Cin]
         low, details, _ = haar_decompose(
             rearrange(normalized, "b t c -> b c t"), self.levels)
+        # [B,T,Cin] -> [B,Cin,T] -> low [B,Cin,L_J], details L_1..L_J.
         processed_low = self.branches[0](low)
         processed_details = [
             branch(detail)
@@ -206,6 +218,7 @@ class WPMixerBlock(nn.Module):
             processed_low, processed_details)  # [B,Cin,T or T+1]
         reconstructed = reconstructed[..., -self.seq_len:]  # [B,Cin,T]
         reconstructed = rearrange(reconstructed, "b c t -> b t c")
+        # [B,Cin,T] -> [B,T,Cin] before inverse normalization/output Linear.
         # Inverse of the affine RevIN stage, then of instance normalization.
         restored = ((reconstructed - self.input_affine_bias) /
                     (self.input_affine_weight + 1e-10))

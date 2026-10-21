@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import torch
+from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
@@ -39,30 +40,38 @@ class _TorchSelectiveMixer(nn.Module):
         self.out_proj = nn.Linear(self.inner, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, nodes, _ = x.shape
+        """Selective node scan [B,N,D] -> [B,N,D], N=sensor nodes."""
+        batch_size, num_nodes, _ = x.shape
         # Node-axis selective scan: [B,N,D] -> signal/gate [B,N,D*expand].
         signal, gate = self.in_proj(x).chunk(2, -1)
+        # Both [B,N,inner]; depthwise Conv1d filters along the node axis.
         signal = F.silu(
-            self.conv(signal.transpose(1, 2))[..., :nodes].transpose(1, 2))
-        raw, b, c = self.x_proj(signal).split(
+            rearrange(self.conv(rearrange(signal, "b n d -> b d n"))
+                      [..., :num_nodes], "b d n -> b n d"))
+        # [B,N,inner] -> [B,N,rank+2*state_dim], split into SSM terms.
+        raw, input_state, output_state = self.x_proj(signal).split(
             [self.dt_proj.in_features, self.d_state, self.d_state], -1)
-        dt = F.softplus(self.dt_proj(raw).float())
-        a = -self.A_log.float().exp()
-        state = torch.zeros(batch,
+        delta_t = F.softplus(self.dt_proj(raw).float())  # [B,N,inner]
+        state_transition = -self.A_log.float().exp()  # [inner,state_dim]
+        state = torch.zeros(batch_size,
                             self.inner,
                             self.d_state,
                             device=x.device,
                             dtype=torch.float32)
         outputs = []
-        for t in range(nodes):
+        for node_index in range(num_nodes):
             # State [B,inner,state_dim]; one node is consumed per scan step.
-            delta = dt[:, t, :, None]
-            state = (delta * a).exp() * state + delta * b[:, t, None, :].float(
-            ) * signal[:, t, :, None].float()
-            read = (state * c[:, t, None, :].float()
-                    ).sum(-1) + self.D.float() * signal[:, t].float()
+            delta = delta_t[:, node_index, :, None]  # [B,inner,1]
+            state = ((delta * state_transition).exp() * state +
+                     delta * input_state[:, node_index, None, :].float() *
+                     signal[:, node_index, :, None].float())
+            read = ((state * output_state[:, node_index, None, :].float())
+                    .sum(-1) + self.D.float() *
+                    signal[:, node_index].float())  # [B,inner]
             outputs.append(
-                (read.to(x.dtype) * F.silu(gate[:, t])).unsqueeze(1))
+                (read.to(x.dtype) * F.silu(gate[:, node_index])).unsqueeze(1))
+            # [B,inner] -> [B,1,inner] for node-axis concatenation.
+        # [B,N,inner] -> [B,N,D].
         return self.out_proj(torch.cat(outputs, 1))
 
 
@@ -97,20 +106,27 @@ class _BiNodeLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Bidirectional sensor-node encoder [B,N,D] -> [B,N,D]."""
         # Both scans consume [B,N,D]; reversing N supplies opposite context.
         spatial = self.forward_scan(x) + self.reverse_scan(x.flip(1)).flip(1)
         encoded = self.norm1(spatial)
         # Pointwise FFN uses Conv1d layout [B,D,N], then returns [B,N,D].
-        ff = self.dropout(F.gelu(self.conv1(encoded.transpose(1, 2))))
-        ff = self.dropout(self.conv2(ff).transpose(1, 2))
+        ff = self.dropout(F.gelu(self.conv1(
+            rearrange(encoded, "b n d -> b d n"))))
+        # [B,N,D] -> [B,D,N] -> [B,Dff,N].
+        ff = self.dropout(rearrange(self.conv2(ff), "b d n -> b n d"))
+        # [B,Dff,N] -> [B,D,N] -> [B,N,D].
         return self.norm2(encoded + ff)
 
 
 def _moving_average(x: torch.Tensor, kernel: int) -> torch.Tensor:
     """Official SeriesDec edge replication; [B,T,N] -> [B,T,N]."""
     half = (kernel - 1) // 2
-    padded = F.pad(x.transpose(1, 2), (half, half), mode='replicate')
-    return F.avg_pool1d(padded, kernel, stride=1).transpose(1, 2)
+    padded = F.pad(rearrange(x, "b t n -> b n t"),
+                   (half, half), mode='replicate')
+    # [B,T,N] -> [B,N,T+2*half] -> [B,N,T] -> [B,T,N].
+    return rearrange(F.avg_pool1d(padded, kernel, stride=1),
+                     "b n t -> b t n")
 
 
 class DSTMambaBlock(nn.Module):
@@ -144,9 +160,9 @@ class DSTMambaBlock(nn.Module):
         if min(in_dim, out_dim, seq_len, d_model, node_dim, rank, trend_kernel,
                ds_window, depth, d_state, d_conv, expand) < 1:
             raise ValueError('dimensions must be positive')
-        if node_dim >= d_model or trend_kernel % 2 != 1 or ds_layers < 0 or backend not in {
-                'auto', 'official', 'torch'
-        } or ds_type not in {'avg', 'max'}:
+        if (node_dim >= d_model or trend_kernel % 2 != 1 or ds_layers < 0
+                or backend not in {'auto', 'official', 'torch'}
+                or ds_type not in {'avg', 'max'}):
             raise ValueError(
                 'invalid node_dim, trend_kernel, ds_layers, ds_type or backend'
             )
@@ -185,40 +201,44 @@ class DSTMambaBlock(nn.Module):
         self.output = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,L,N] -> [B,L,Cout], L=fixed history/adapter length."""
         if x.ndim != 3 or x.shape[1] != self.seq_len or x.shape[
                 2] != self.in_dim:
             raise ValueError(f'expected [B,{self.seq_len},{self.in_dim}]')
         # RevIN.py: mean and population stdev are detached per sample/node.
-        mean = x.mean(1, keepdim=True).detach()
+        mean = x.mean(1, keepdim=True).detach()  # [B,1,N]
         std = torch.sqrt(x.var(1, keepdim=True, unbiased=False) +
                          1e-5).detach()
         # RevIN statistics [B,1,N] normalize each sample and sensor separately.
         normalized = (
             x - mean) / std * self.revin_weight + self.revin_bias  # [B,L,N]
         seasonal = normalized - _moving_average(normalized, self.trend_kernel)
-        base = self.embed_dropout(self.embedding(seasonal.transpose(
-            1, 2)))  # [B,N,E]
+        # [B,L,N] -> [B,N,L] -> temporal Linear(L,E) -> [B,N,E].
+        base = self.embed_dropout(self.embedding(
+            rearrange(seasonal, "b t n -> b n t")))
         adaptation = F.relu(self.lora(self.adapter))  # [N,E,Da]
         spatial = torch.einsum('bne,ned->bnd', base, adaptation)  # [B,N,Da]
         token = torch.cat((base, spatial), -1)  # [B,N,D]
         for layer in self.layers:
             token = layer(token)
         # Spatial tokens [B,N,D] project over the fixed L-step output axis.
-        sea = self.projector(self.encoder_norm(token)).transpose(1,
-                                                                 2)  # [B,L,N]
+        sea = rearrange(self.projector(self.encoder_norm(token)),
+                        "b n t -> b t n")  # [B,N,D] -> [B,L,N]
 
         # DSTMamba_Arch: downsample the normalized *full signal* first,
         # decompose each scale separately, then mix trends coarse -> fine.
         scales = [normalized]
-        current = normalized.transpose(1, 2)
+        current = rearrange(normalized, "b t n -> b n t")  # [B,N,L]
         for _ in self.up_sampling:
             # Downsample time only: [B,N,L_i] -> [B,N,L_(i+1)].
             current = self.down_pool(current)
-            scales.append(current.transpose(1, 2))
+            scales.append(rearrange(current, "b n t -> b t n"))
+            # [B,N,L_i] -> [B,L_i,N] for per-scale decomposition.
         trends = [
-            _moving_average(s, self.trend_kernel).transpose(1, 2)
+            rearrange(_moving_average(s, self.trend_kernel),
+                      "b t n -> b n t")
             for s in scales
-        ]
+        ]  # each [B,N,L_i]
         reverse = list(reversed(trends))
         coarse = reverse[0]
         mixed = [coarse]
@@ -228,15 +248,15 @@ class DSTMambaBlock(nn.Module):
             mixed.append(coarse)
         mixed.reverse()
         projected = [
-            mapping(t).transpose(1, 2)
-            for mapping, t in zip(self.linear_mappings, mixed)
-        ]
+            rearrange(mapping(trend_scale), "b n t -> b t n")
+            for mapping, trend_scale in zip(self.linear_mappings, mixed)
+        ]  # each [B,L,N]
         trend = torch.stack(projected, -1).sum(-1)  # [B,L,N]
         pred = sea + self.trend_weight[None, None, :] * trend
         # RevIN denormalization happens before optional N->Cout projection.
         pred = (pred - self.revin_bias) / (self.revin_weight +
                                            1e-10) * std + mean
-        return self.output(pred)
+        return self.output(pred)  # [B,L,Cout].
 
 
 if __name__ == '__main__':

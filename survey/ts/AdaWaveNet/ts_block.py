@@ -17,6 +17,7 @@ def _moving_average(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
     left = kernel_size - 1 - (kernel_size - 1) // 2
     right = (kernel_size - 1) // 2
     extended = F.pad(x, (left, right), mode="replicate")
+    # [B,C,T] -> [B,C,T+left+right] -> moving-average [B,C,T].
     return F.avg_pool1d(extended, kernel_size, stride=1)
 
 
@@ -32,11 +33,13 @@ class _LearnedFilter(nn.Module):
         self.norm = nn.LayerNorm((channels, length))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,C,L] -> [B,C,L] after same-length depthwise filtering."""
         # Official LiftingScheme uses ReflectionPad1d. Reflection is undefined
         # when a coarse band is too short; only then replicate its boundary.
         mode = "reflect" if x.size(-1) > max(self.left,
                                              self.right) else "replicate"
         padded = F.pad(x, (self.left, self.right), mode=mode)
+        # [B,C,L] -> [B,C,L+kernel-1]; Conv1d returns [B,C,L].
         return self.norm(self.activation(self.conv(padded)))
 
 
@@ -67,10 +70,12 @@ class AdaptiveLifting(nn.Module):
         self.predict = _LearnedFilter(channels, half_length, kernel_size)
 
     def forward(self, x: torch.Tensor):
+        """[B,C,T] -> coarse/detail each [B,C,ceil(T/2)]."""
         if x.size(-1) != self.length:
             raise ValueError("wrong lifting input length")
         if self.length % 2:
             x = F.pad(x, (0, 1), mode="replicate")
+            # Odd T -> T+1 before even/odd splitting.
         even, odd = x[..., ::2], x[..., 1::2]  # each [B,C,ceil(T/2)]
         coarse = even + self.update(odd)
         detail = odd - self.predict(coarse)
@@ -78,12 +83,14 @@ class AdaptiveLifting(nn.Module):
 
     def inverse(self, coarse: torch.Tensor,
                 detail: torch.Tensor) -> torch.Tensor:
+        """Two [B,C,ceil(T/2)] bands -> restored [B,C,T]."""
         if coarse.shape != detail.shape:
             raise ValueError("coarse/detail must have matching shapes")
         odd = detail + self.predict(coarse)
         even = coarse - self.update(odd)
         interleaved = rearrange(torch.stack((even, odd), dim=-1),
                                 "b c t pair -> b c (t pair)")
+        # [B,C,L,2] -> [B,C,2L], then trim the original odd T if needed.
         return interleaved[..., :self.length]  # [B,C,T]
 
 
@@ -110,6 +117,7 @@ class _PublishedInverseLifting(nn.Module):
 
     def forward(self, coarse: torch.Tensor,
                 detail: torch.Tensor) -> torch.Tensor:
+        """Published independent decoder: two [B,C,L] -> [B,C,2L]."""
         # Published order (not the inverse of modified encoder lifting).
         even = coarse - self.update(detail)  # [B,C,L]
         odd = detail + self.predict(even)  # [B,C,L]
@@ -130,10 +138,12 @@ class _PublishedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Channel attention [B,C,D] -> [B,C,D], score [B,H,C,C]."""
         q = rearrange(self.query(x), "b c (h d) -> b h c d", h=self.heads)
         k = rearrange(self.key(x), "b c (h d) -> b h c d", h=self.heads)
         v = rearrange(self.value(x), "b c (h d) -> b h c d", h=self.heads)
         scores = torch.matmul(q, k.transpose(-1, -2)) / q.size(-1)**0.5
+        # Q/K/V:[B,H,C,D/H]; scores:[B,H,C,C].
         weights = self.dropout(torch.softmax(scores, dim=-1))
         result = torch.matmul(weights, v)  # [B,heads,C,d_head]
         return self.output(rearrange(result, "b h c d -> b c (h d)"))
@@ -154,10 +164,13 @@ class _PublishedEncoderLayer(nn.Module):
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Official channel-token encoder layer [B,C,D] -> same."""
         x = self.norm1(x + self.dropout(self.attention(x)))
+        # Pointwise Conv1d: [B,C,D] -> [B,D,C] -> [B,Dff,C].
         y = self.activation(self.conv1(rearrange(x, "b c d -> b d c")))
         y = self.dropout(y)
         y = rearrange(self.conv2(y), "b d c -> b c d")
+        # [B,Dff,C] -> [B,D,C] -> [B,C,D].
         return self.norm2(x + self.dropout(y))
 
 
@@ -232,18 +245,22 @@ class AdaWaveNetBlock(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 clusters: torch.Tensor | None = None) -> torch.Tensor:
+        """[B,T,Cin] and optional cluster IDs [Cin] -> [B,T,Cout]."""
         if x.ndim != 3 or x.shape[1:] != (self.seq_len, self.in_dim):
             raise ValueError("x must have shape [B,seq_len,in_dim]")
         channels_first = rearrange(x, "b t c -> b c t")
+        # [B,T,Cin] -> [B,Cin,T]; wavelet and trend run along T.
         trend = _moving_average(channels_first, self.trend_kernel)
         seasonal = channels_first - trend  # [B,Cin,T]
         trend_mean = trend.mean(dim=-1, keepdim=True).detach()
+        # trend_mean/trend_scale:[B,Cin,1]; normalized trend:[B,Cin,T].
         trend_scale = (trend.var(dim=-1, keepdim=True, unbiased=False) +
                        1e-5).sqrt().detach()
         trend = (trend - trend_mean) / trend_scale
         trend = (trend * self.trend_affine_weight[None, :, None] +
                  self.trend_affine_bias[None, :, None])
         mean = seasonal.mean(dim=-1, keepdim=True).detach()
+        # seasonal mean/scale:[B,Cin,1].
         scale = (seasonal.var(dim=-1, keepdim=True, unbiased=False) +
                  1e-5).sqrt().detach()
         coarse = (seasonal - mean) / scale
@@ -251,6 +268,7 @@ class AdaWaveNetBlock(nn.Module):
         for lifting, detail_mixer, coarse_skip in zip(
                 self.lifting, self.detail_mixer, self.coarse_skip):
             coarse, detail = lifting(coarse)
+            # Each level halves the time-band length: both [B,Cin,L_i].
             # AdaWaveNet's AdpWaveletBlock applies separate affine-free
             # InstanceNorm1d to c and d before any branch projection.
             coarse = _instance_normalize(coarse)
@@ -261,9 +279,11 @@ class AdaWaveNetBlock(nn.Module):
         # Treat channels as attention tokens, with coarse time samples as
         # features: [B,Cin,L_J] -> [B,Cin,d_model] -> [B,Cin,L_J].
         tokens = self.embedding_dropout(self.coarse_embedding(coarse))
+        # [B,Cin,L_J] -> [B,Cin,D]; channel axis becomes attention tokens.
         for encoder_layer in self.channel_encoder:
             tokens = encoder_layer(tokens)
         coarse = self.coarse_readout(self.channel_norm(tokens))
+        # [B,Cin,D] -> [B,Cin,L_J].
         for inverse, skip, (detail, encoded), decoder in zip(
                 reversed(self.inverse_lifting), reversed(skips),
                 reversed(details), reversed(self.detail_decoder)):
@@ -271,6 +291,7 @@ class AdaWaveNetBlock(nn.Module):
             # Odd-length windows are a generic-block extension: the released
             # model assumes lengths divisible by 2**levels.
             coarse = inverse(coarse[..., :skip.size(-1)] + skip, detail)
+            # Decoder band pair [B,Cin,L_i] -> restored [B,Cin,2L_i].
         coarse = coarse[..., :self.seq_len]
         seasonal_out = self.season_projection(coarse)
         seasonal_out = seasonal_out * scale + mean  # [B,Cin,T]
@@ -285,9 +306,10 @@ class AdaWaveNetBlock(nn.Module):
             self.trend_mixer[int(clusters[channel])](
                 trend[:, channel:channel + 1])
             for channel in range(self.in_dim)
-        ], dim=1)
+        ], dim=1)  # Cin separate [B,1,T] cluster maps -> [B,Cin,T].
         trend_out = ((trend_out - self.trend_affine_bias[None, :, None]) /
                      (self.trend_affine_weight[None, :, None] + 1e-10))
         trend_out = trend_out * trend_scale + trend_mean
         combined = rearrange(seasonal_out + trend_out, "b c t -> b t c")
+        # [B,Cin,T] -> [B,T,Cin]; output Linear mixes series.
         return self.output(combined)  # [B,T,Cout]

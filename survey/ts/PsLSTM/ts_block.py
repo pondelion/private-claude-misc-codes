@@ -48,10 +48,13 @@ class SLSTMCell(nn.Module):
 
     def forward(self, x: torch.Tensor, x_conv: torch.Tensor,
                 state: tuple[torch.Tensor, ...]):
+        """One patch step: x/x_conv [B,D], state four [B,D] -> same."""
+        # h=hidden, c=cell, n=normalizer, m=log-domain stabilizer.
         h, c, n, m = state
         # Grouped conv emits [head, gate, head_channel]. The dense input
         # projection emits [gate, head, head_channel]; reorder before adding.
         recurrent = self.recurrent(h.unsqueeze(-1)).squeeze(-1)
+        # [B,D] -> [B,D,1] -> grouped Conv [B,4D,1] -> [B,4D].
         recurrent = rearrange(recurrent,
                               "b (h g d) -> b (g h d)",
                               h=self.heads,
@@ -62,6 +65,7 @@ class SLSTMCell(nn.Module):
         # concatenated as [gate, head, channel]. Never add in mismatched order.
         def gate_major(proj, value):
             y = proj(value.unsqueeze(-1)).squeeze(-1)
+            # [B,D] -> [B,2D] in head-major gate layout.
             # Grouped convolution orders [H,G,Dh]; gates require [G,H,Dh].
             return rearrange(y,
                              "b (h g d) -> b (g h d)",
@@ -72,6 +76,7 @@ class SLSTMCell(nn.Module):
         gates = torch.cat(
             (gate_major(self.input_conv, x_conv), gate_major(
                 self.input_raw, x)), -1) + recurrent + self.bias
+        # Two [B,2D] inputs concatenate to [B,4D], then split into 4 gates.
         i_raw, f_raw, z_raw, o_raw = gates.chunk(4, -1)
         # m is a log-domain normalizer. With m0=-inf, the first input weight is 1.
         # Released xLSTM vanilla sLSTM uses sigmoid forget gate; its log is
@@ -111,28 +116,37 @@ class SLSTMLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, p, d = x.shape
-        h = x.new_zeros(b, d)
-        c = x.new_zeros(b, d)
-        n = x.new_zeros(b, d)
-        m = x.new_full((b, d), -torch.inf)
+        """[B,N,D] -> [B,N,D], N=patch tokens, D=hidden features."""
+        batch_size, patch_count, hidden_dim = x.shape
+        h = x.new_zeros(batch_size, hidden_dim)
+        c = x.new_zeros(batch_size, hidden_dim)
+        n = x.new_zeros(batch_size, hidden_dim)
+        m = x.new_full((batch_size, hidden_dim), -torch.inf)
         outputs = []
-        x_norm = self.norm1(x)
-        x_conv = F.silu(
-            self.preconv(x_norm.transpose(1, 2))[..., :p].transpose(1, 2))
-        for t in range(p):
-            y, (h, c, n, m) = self.cell(x_norm[:, t], x_conv[:, t],
+        normalized_patches = self.norm1(x)  # [B,N,D]
+        # Depthwise temporal preconv: [B,N,D] -> [B,D,N] -> [B,N,D].
+        convolved_patches = F.silu(
+            self.preconv(rearrange(normalized_patches,
+                                   "b n d -> b d n"))[..., :patch_count]
+            .transpose(1, 2))
+        for patch_index in range(patch_count):
+            y, (h, c, n, m) = self.cell(
+                normalized_patches[:, patch_index],
+                convolved_patches[:, patch_index],
                                         (h, c, n, m))
             outputs.append(y.unsqueeze(1))
-        y = torch.cat(outputs, 1)  # [B,P,D]
+        y = torch.cat(outputs, 1)  # [B,N,D]
         # MultiHeadLayerNorm applies GroupNorm independently to each patch.
         # GroupNorm treats each (batch, patch) pair as one sample: [B*P,D].
-        y = rearrange(y, "b p d -> (b p) d")
+        y = rearrange(y, "b p d -> (b p) d")  # [B*N,D]
         y = F.group_norm(y, self.heads, weight=self.group_weight)
-        y = rearrange(y, "(b p) d -> b p d", b=b, p=p)
-        z = x + self.dropout(y)
-        gate, value = self.ffn_up(self.norm2(z)).chunk(2, -1)
-        return z + self.dropout(self.ffn_down(F.gelu(gate) * value))
+        y = rearrange(y, "(b p) d -> b p d",
+                      b=batch_size, p=patch_count)  # [B,N,D]
+        residual_tokens = x + self.dropout(y)  # [B,N,D]
+        gate, value = self.ffn_up(self.norm2(residual_tokens)).chunk(2, -1)
+        # Each gated FFN branch [B,N,Dff] -> down-projected [B,N,D].
+        return residual_tokens + self.dropout(
+            self.ffn_down(F.gelu(gate) * value))
 
 
 class PsLSTMBlock(nn.Module):
@@ -172,37 +186,47 @@ class PsLSTMBlock(nn.Module):
         self.channel_mix = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> [B,T,Cout], sharing sLSTM across input series."""
         if x.ndim != 3 or x.size(-1) != self.in_dim or x.size(1) < 1:
             raise ValueError(f"expected [B,T,{self.in_dim}] with T>=1")
-        b, t, c = x.shape
-        patches = max(1,
-                      math.ceil(max(0, t - self.patch_size) / self.stride) + 1)
-        padded_t = (patches - 1) * self.stride + self.patch_size
-        # [B,T,C] -> [B*C,Tpad] -> [B*C,P,K]; C channels stay independent.
-        xc = rearrange(x, "b t c -> (b c) t")
-        xc = F.pad(xc, (0, padded_t - t), mode="replicate")
-        p = xc.unfold(-1, self.patch_size, self.stride)
-        z = self.embed(p)
+        batch_size, seq_len, num_series = x.shape
+        patch_count = max(
+            1, math.ceil(max(0, seq_len - self.patch_size) / self.stride) + 1)
+        padded_len = (patch_count - 1) * self.stride + self.patch_size
+        # [B,T,Cin] -> [B*Cin,T]; shared backbone, no early series fusion.
+        series_streams = rearrange(x, "b t c -> (b c) t")
+        series_streams = F.pad(
+            series_streams, (0, padded_len - seq_len), mode="replicate")
+        # [B*Cin,T] -> [B*Cin,Tpad] -> [B*Cin,N,K].
+        patch_values = series_streams.unfold(
+            -1, self.patch_size, self.stride)
+        patch_tokens = self.embed(patch_values)  # [B*Cin,N,D]
         for layer in self.layers:
-            z = layer(z)
-        z = self.post_norm(z)  # [B*C,P,D], official stack output boundary.
-        values = self.to_patch(z)  # [B*C,P,K]
+            patch_tokens = layer(patch_tokens)  # [B*Cin,N,D]
+        patch_tokens = self.post_norm(patch_tokens)
+        # [B*Cin,N,D], official encoder boundary.
+        values = self.to_patch(patch_tokens)  # [B*Cin,N,K]
         if self.stride == self.patch_size:
             # Nonoverlapping patches need no scatter/add and are the fast path.
             out = rearrange(values, "bc p k -> bc (p k)")
+            # [B*Cin,N,K] -> [B*Cin,Tpad] for nonoverlapping patches.
         else:
             # F.fold performs overlap-add on a 1xT image; count rescales overlaps.
-            cols = values.transpose(1, 2)  # [B*C,K,P]
-            out = F.fold(cols, (1, padded_t), (1, self.patch_size),
+            cols = rearrange(values, "bc n k -> bc k n")  # [B*Cin,K,N]
+            out = F.fold(cols, (1, padded_len), (1, self.patch_size),
                          stride=(1, self.stride)).squeeze(2).squeeze(1)
-            count = F.fold(torch.ones_like(cols), (1, padded_t),
+            count = F.fold(torch.ones_like(cols), (1, padded_len),
                            (1, self.patch_size),
                            stride=(1, self.stride)).squeeze(2).squeeze(1)
+            # Fold produces [B*Cin,Tpad]; divide by overlap count pointwise.
             out = out / count.clamp_min(1)
-        out = rearrange(out, "(b c) t -> b c t", b=b, c=c)[:, :, :t]
+        out = rearrange(out, "(b c) t -> b c t",
+                        b=batch_size, c=num_series)[:, :, :seq_len]
+        # [B*Cin,Tpad] -> [B,Cin,Tpad] -> [B,Cin,T].
         # The task-specific forecast head has been replaced by a same-length
         # patch readout; the backbone features are not bypassed by raw input.
-        return self.channel_mix(out.transpose(1, 2))
+        # [B,Cin,T] -> [B,T,Cin] -> [B,T,Cout].
+        return self.channel_mix(rearrange(out, "b c t -> b t c"))
 
 
 if __name__ == "__main__":

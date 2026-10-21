@@ -55,6 +55,7 @@ class FITSBlock(nn.Module):
             nn.init.zeros_(self.output.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> [B,T,Cout]; T is even, F=T//2+1 FFT bins."""
         if x.ndim != 3 or x.size(-1) != self.in_dim:
             raise ValueError("x must have shape [B,T,in_dim]")
         batch, length, channels = x.shape
@@ -75,6 +76,8 @@ class FITSBlock(nn.Module):
         normalized = (x - mean) / scale  # [B,T,Cin]
         spectrum = torch.fft.rfft(normalized,
                                   dim=1)  # [B,F,Cin], F=floor(T/2)+1
+        # Keep K=cut_freq low bins and make frequency the Linear input axis:
+        # [B,F,Cin] -> [B,Cin,K]. No series fusion occurs in this mixer.
         low = rearrange(spectrum[:, :self.cut_freq], "b f c -> b c f")
         if self.individual:
             mixed = torch.stack([
@@ -84,11 +87,11 @@ class FITSBlock(nn.Module):
                                 dim=1)  # [B,Cin,cut_freq]
         else:
             mixed = self.freq_upsampler(low)  # [B,Cin,cut_freq]
-        mixed = rearrange(mixed, "b c f -> b f c")
+        mixed = rearrange(mixed, "b c f -> b f c")  # [B,K,Cin]
 
         # Zero-fill omitted high frequencies; unlike forecasting FITS the FFT
         # length is unchanged, so the original length-ratio correction is 1.
-        full = mixed.new_zeros((batch, bins, channels))
+        full = mixed.new_zeros((batch, bins, channels))  # [B,F,Cin]
         full[:, :self.cut_freq] = mixed
         decoded = torch.fft.irfft(full, n=length, dim=1)  # [B,T,Cin]
         if self.residual:

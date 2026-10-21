@@ -51,10 +51,11 @@ Stage 2 … Stage S: [B,M,D_s,P_s]、同じ Block を各 stage で反復
   │
   ├─ 原著の予測 head: 変数ごと [D_s,P_s] を連結 → Linear(D_s·P_s,H)
   │                     → 予測 Ŷ [B,H,M] ── MSE ── GT Y [B,H,M]
-  └─ 今回の同長 adapter: D_s を readout → 時間補間 → [B,T,Cout]
+  └─ 今回の同長 adapter: 転置畳み込みでpatch軸を段階的に展開
+                       → [B,T,Cin] → 出力Linear → [B,T,Cout]
 ```
 
-`P_s` は stage s の patch 数で、予測 horizon `H` とは別。図の二枝 large/small Conv は **学習時**の形で、`eval()` 後の kernel 融合では同等の一枝 Conv にできる。公開 long-term forecasting file に存在する multi-scale fusion 用層は、この図の対象 `forward_feature` では呼ばれないため描いていない。今回の同長 readout・時間補間は原著の固定 H 予測 head ではない。
+`P_s` は stage s の patch 数で、予測 horizon `H` とは別。図の二枝 large/small Conv は **学習時**の形で、`eval()` 後の kernel 融合では同等の一枝 Conv にできる。公開 long-term forecasting file に存在する multi-scale fusion 用層は、この図の対象 `forward_feature` では呼ばれないため描いていない。今回の転置畳み込みによる同長decoderは原著の固定 H 予測 head ではない。
 
 ## 原著 backbone の経路
 
@@ -77,7 +78,7 @@ ModernTCN は複数タスク用 backbone なので単一 objective はない。l
 
 ## 実用同長ブロック
 
-[ts_block.py](ts_block.py) の `ModernTCNBlock(in_dim,out_dim)` は `[B,T,Cin]→[B,T,Cout]`。公式の patch stem、large/small 再パラメータ化 DWConv、二段 grouped FFN を保ち、task 固有の head を時間補間＋出力線形に置換した。既定は軽い単一 stage だが、`stage_dims=(32,64,128,256), stage_depths=(2,2,2,2)` のようにすれば公式に沿う **stage 間 BN→stride Conv の多段 backbone** を構築できる。原著の固定 horizon head と RevIN は同長 adapter へ含めないので、論文モデル完全再現ではない。推論前は `model.eval(); model.merge_kernels()` で畳み込み統合できる。学習再開時は非統合モデルを使う。
+[ts_block.py](ts_block.py) の `ModernTCNBlock(in_dim,out_dim)` は `[B,T,Cin]→[B,T,Cout]`。公式の patch stem、large/small 再パラメータ化 DWConv、二段 grouped FFN を保ち、task 固有の head を学習可能な転置畳み込みdecoder＋出力線形に置換した。既定は軽い単一 stage だが、`stage_dims=(32,64,128,256), stage_depths=(2,2,2,2)` のようにすれば公式に沿う **stage 間 BN→stride Conv の多段 backbone** を構築できる。原著の固定 horizon head と RevIN は同長 adapter へ含めないので、論文モデル完全再現ではない。推論前は `model.eval(); model.merge_kernels()` で畳み込み統合できる。学習再開時は非統合モデルを使う。
 
 ```python
 from ts_block import ModernTCNBlock
@@ -152,9 +153,9 @@ reshape/transposeして Dをgroupとした ConvFFN2:
 
 ## off-the-shelf ブロックでの変更と推奨設定
 
-本 `ModernTCNBlock` は既定で単一解像度の patch stem + 指定 depth の Block を持ち、`stage_dims/stage_depths` を渡すと複数 stage と stage 間 downsampling を使う。原著の固定 H flatten head、RevIN、任意の trend/residual 二重モデルは同長 adapter に含めない。代わりに最終 `[B,M,D,K]→[B,K,M]→時間補間して[B,T,M]→Linear(M,Cout)` とし、任意 T で同長特徴を返す。原著の予測 head は未来 `H` 点を返すだけで入力の各時刻に対応する特徴を返せないため、この置換が必要である。ただし補間は細かい時間変化を平滑化し得る。高周波の時点対応が重要なら patch size/stride を小さくする。
+本 `ModernTCNBlock` は既定で単一解像度の patch stem + 指定 depth の Block を持ち、`stage_dims/stage_depths` を渡すと複数 stage と stage 間 downsampling を使う。原著の固定 H flatten head、RevIN、任意の trend/residual 二重モデルは同長 adapter に含めない。backbone の最終出力 `[B,Cin,D_last,P_last]` から、各 stage の `ConvTranspose1d` で patch 数を逆順に増やし、stem に対応する `ConvTranspose1d` で `[B,Cin,T]` へ戻す。最後の `Linear(Cin,Cout)` が系列間を融合する。原著の予測 head は未来 `H` 点を返すだけで入力の各時刻に対応する特徴を返せないため、この同長 decoder が必要である。補間と違い潜在特徴幅 `D_last` を先に 1 へ潰さず、学習可能な upsampling に利用する。ただし downsampling で失われた情報を必ず復元できるわけではない。高周波の時点対応が重要なら patch size/stride を小さくする。
 
-[verify_official.py](verify_official.py) は公式 long-term forecasting 実装の `Block` と `ModernTCNUnit` の出力・入力勾配を比較する。さらに stem、2 stage、stage 間 downsampling、両 stage の Block まで、対応する重みで**backbone 最終出力が一致**することを確認する。原著の固定 horizon head を同長の補間・readout に置き換えた部分は一致しない。別途 `merge_kernels()` 前後の出力も検査する。
+[verify_official.py](verify_official.py) は公式 long-term forecasting 実装の `Block` と `ModernTCNUnit` の出力・入力勾配を比較する。さらに stem、2 stage、stage 間 downsampling、両 stage の Block まで、対応する重みで**backbone 最終出力が一致**することを確認する。原著の固定 horizon head を同長の転置畳み込み decoder に置き換えた部分は公式との一致対象ではない。別途 `merge_kernels()` 前後の出力も検査する。
 
 複数系列を batch 化する際は M と特徴順を固定する。`ConvFFN2` は M 軸を混ぜるため、列順を入れ替えてそのまま推論することはできない。padding された可変長系列でも Conv/BN は padding の値を見てしまうので、長さ mask による特別な処理を追加する。BN は小 batch や分布変動の大きいストリーミングデータでは統計が不安定になり得るため、訓練/推論分布を揃える。
 
@@ -165,7 +166,7 @@ reshape/transposeして Dをgroupとした ConvFFN2:
 | patch stem / stage downsample | `models/ModernTCN.py::ModernTCN` | `ModernTCNBlock.stem/downsamples/stages`。既定一段、複数段選択可 |
 | large/small DWConv と BN fuse | `ReparamLargeKernelConv` | `ReparamDepthwise`、`merge_kernel` |
 | 変数内・変数間 FFN | `Block` の `ffn1/ffn2` | `ModernTCNUnit.ffn_var/ffn_cross` |
-| 予測/補完等の task head | task 別 `ModernTCN.py` | 同長 readout と出力 Linear。未来予測 head は fine-tune script |
+| 予測/補完等の task head | task 別 `ModernTCN.py` | 同長転置畳み込み decoder と出力 Linear。未来予測 head は fine-tune script |
 | 論文 forecasting objective | task runner の MSE | `finetuning_example.py::fit` の MSE |
 
 公開 `ReparamLargeKernelConv.PaddingTwoEdge1d` には `torch.cat(...,dims=-1)` のような実行不能な引数名が見られる。本版は `F.pad` と device/dtype 一致を用いて BN 融合を実装し、数値一致をテストした。原著の学習済み checkpoint を直接読み込むための key/shape 互換は提供しない。

@@ -3,7 +3,9 @@
 These are *not* replacements for the official fused GPU kernels in a throughput
 benchmark.  They follow the official projection order and recurrent equations,
 and keep every time-step in the autograd graph.  Axes: B=batch, T=time,
-H=heads, P=head width, N=state width, G=B/C groups, R=MIMO rank.
+H=heads, P=head width, N=state width, G=state-parameter groups,
+R=MIMO rank. The ``b``/``c`` tensors below are standard SSM input/output
+state projections, not batch size or time-series channels.
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ class TorchMamba(nn.Module):
         self.out_proj = nn.Linear(self.inner, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mamba-1 scan: [B,T,D] -> [B,T,D], T=time, D=model width."""
         if x.ndim != 3 or x.size(-1) != self.d_model or x.size(1) < 1:
             raise ValueError(
                 f"expected [B,T,{self.d_model}], got {tuple(x.shape)}")
@@ -74,8 +77,11 @@ class TorchMamba(nn.Module):
         # Causal depthwise convolution preserves [B,T,inner].
         signal = F.silu(
             self.conv(signal.transpose(1, 2))[..., :time].transpose(1, 2))
+        # [B,T,inner] -> Conv1d layout [B,inner,T], causal crop,
+        # then back to [B,T,inner].
         dt_raw, b_t, c_t = self.x_proj(signal).split(
             [self.dt_proj.in_features, self.d_state, self.d_state], dim=-1)
+        # [B,T,rank+2N] -> rank [B,T,rank] and B/C each [B,T,N].
         delta = F.softplus(
             self.dt_proj(dt_raw).float())  # [B,T,H], positive step
         a = -self.A_log.float().exp()  # [H,N], stable continuous A
@@ -94,6 +100,7 @@ class TorchMamba(nn.Module):
             y_t = (state * c_t[:, t, None, :].float()).sum(-1)
             y_t = y_t + self.D.float() * signal[:, t].float()
             outputs.append((y_t.to(x.dtype) * F.silu(gate[:, t])).unsqueeze(1))
+        # T outputs [B,1,inner] -> [B,T,inner] -> [B,T,D].
         return self.out_proj(torch.cat(outputs, dim=1))
 
 
@@ -112,7 +119,10 @@ class TorchMamba2(nn.Module):
         super().__init__()
         if min(d_model, d_state, d_conv, expand, headdim, ngroups) < 1:
             raise ValueError('dimensions must be positive')
-        self.d_model, self.d_state, self.headdim, self.ngroups = d_model, d_state, headdim, ngroups
+        self.d_model = d_model
+        self.d_state = d_state
+        self.headdim = headdim
+        self.ngroups = ngroups
         self.inner = d_model * expand
         if self.inner % headdim or (self.inner // headdim) % ngroups:
             raise ValueError(
@@ -145,6 +155,7 @@ class TorchMamba2(nn.Module):
         self.out_proj = nn.Linear(self.inner, d_model, bias=False)
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
+        """Mamba-2 scan: [B,T,D] -> [B,T,D]."""
         if u.ndim != 3 or u.shape[-1] != self.d_model or u.shape[1] < 1:
             raise ValueError(f'expected [B,T,{self.d_model}] with T>0')
         batch, time, _ = u.shape
@@ -156,6 +167,8 @@ class TorchMamba2(nn.Module):
         # The convolution sees x, B and C jointly; z and dt bypass it.
         xbc = F.silu(
             self.conv1d(xbc.transpose(1, 2))[..., :time].transpose(1, 2))
+        # [B,T,inner+2G*N] -> Conv1d [B,inner+2G*N,T]
+        # -> causal crop -> [B,T,inner+2G*N].
         x, b, c = xbc.split([
             self.inner, self.ngroups * self.d_state,
             self.ngroups * self.d_state
@@ -164,6 +177,7 @@ class TorchMamba2(nn.Module):
         x = rearrange(x, "b t (h p) -> b t h p", p=self.headdim)
         b = rearrange(b, "b t (g n) -> b t g n", g=self.ngroups)
         c = rearrange(c, "b t (g n) -> b t g n", g=self.ngroups)
+        # X:[B,T,H,P], SSM B/C:[B,T,G,N].
         dt = F.softplus(dt_raw.float() +
                         self.dt_bias.float()).clamp(*self.dt_limit)
         a = -self.A_log.float().exp()
@@ -228,16 +242,22 @@ class TorchMamba3(nn.Module):
                 0.5, 1.0) or d_state % 2 or d_state * rope_fraction < 2:
             raise ValueError(
                 'd_state must be even with at least one rotary pair')
-        self.d_model, self.d_state, self.headdim, self.ngroups = d_model, d_state, headdim, ngroups
+        self.d_model = d_model
+        self.d_state = d_state
+        self.headdim = headdim
+        self.ngroups = ngroups
         self.inner = d_model * expand
         if self.inner % headdim or (self.inner // headdim) % ngroups:
             raise ValueError(
                 'expand*d_model must be divisible by headdim*ngroups')
         self.nheads = self.inner // headdim
         self.rank = mimo_rank if is_mimo else 1
-        self.is_mimo, self.is_outproj_norm, self.A_floor = is_mimo, is_outproj_norm, A_floor
+        self.is_mimo = is_mimo
+        self.is_outproj_norm = is_outproj_norm
+        self.A_floor = A_floor
         self.nangles = int(d_state * rope_fraction) // 2
-        size = 2 * self.inner + 2 * d_state * ngroups * self.rank + 3 * self.nheads + self.nangles
+        size = (2 * self.inner + 2 * d_state * ngroups * self.rank
+                + 3 * self.nheads + self.nangles)
         self.in_proj = nn.Linear(d_model, size, bias=False)
         dt = torch.exp(
             torch.empty(self.nheads).uniform_(math.log(0.001), math.log(0.1)))
@@ -259,6 +279,7 @@ class TorchMamba3(nn.Module):
         self.out_proj = nn.Linear(self.inner, d_model, bias=False)
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
+        """Mamba-3 SISO/MIMO scan: [B,T,D] -> [B,T,D]."""
         if u.ndim != 3 or u.shape[-1] != self.d_model or u.shape[1] < 1:
             raise ValueError(f'expected [B,T,{self.d_model}] with T>0')
         batch, time, _ = u.shape
@@ -269,6 +290,8 @@ class TorchMamba3(nn.Module):
         ]
         z, x, b, c, dd_dt, dd_a, trap, angles = self.in_proj(u).split(
             parts, -1)
+        # Gate/value:[B,T,inner], B/C:[B,T,R*G*N],
+        # dt/A/trapezoid:[B,T,H], angles:[B,T,nangles].
         # One projection supplies gate/value, rank-grouped B/C, and per-head
         # step, decay, trapezoid weight, and rotary increments.
         # [B,T,H*P] -> [B,T,H,P]; B/C add rank R and group G axes.
@@ -287,6 +310,7 @@ class TorchMamba3(nn.Module):
         # B/C are normalized *before* group broadcast and bias, as in Mamba3.forward.
         b = b.repeat_interleave(self.nheads // self.ngroups, dim=3)
         c = c.repeat_interleave(self.nheads // self.ngroups, dim=3)
+        # [B,T,R,G,N] -> [B,T,R,H,N] by assigning each group to H/G heads.
         dt = F.softplus(dd_dt.float() + self.dt_bias.float())  # [B,T,H]
         a = -_heavy_tail(dd_a.float()).clamp_min(self.A_floor)
         angle_state = torch.zeros(batch,
@@ -320,6 +344,7 @@ class TorchMamba3(nn.Module):
                                          3) + self.C_bias.float()[None]
             kt = b[:, t].float().permute(0, 2, 1,
                                          3) + self.B_bias.float()[None]
+            # [B,R,H,N] -> [B,H,R,N] for rotary state coordinates.
             q = _rotate_pairs(qt, theta[:, :, None, :])  # [B,H,R,N]
             k = _rotate_pairs(kt, theta[:, :, None, :])
             v = x[:, t].float()[:, :, None, :] * (self.mimo_x.float()[None]
@@ -349,6 +374,7 @@ class TorchMamba3(nn.Module):
                 y = y * F.silu(gate)
             y = (y * self.mimo_o.float()[None]
                  ).sum(2) if self.is_mimo else y.squeeze(2)
+            # [B,H,R,P] -> [B,H,P] by rank mixing (or rank-1 squeeze).
             outputs.append(y)
             old_k, old_v = k, v
         # [B,T,H,P] -> [B,T,H*P] before the output projection.

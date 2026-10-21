@@ -1,8 +1,8 @@
 """WFTNet Fourier-period/CWT local-period encoder.
 
 The official wavelet path calls ``ptwt.cwt(..., 'morl')``; this block calls
-the same library operation. FFT periods, Inception blocks, time extension,
-normalization, and the residual path follow the released same-length setting.
+the same library operation. The forecasting-only time extension is omitted:
+WFT features stay aligned to the observed T positions for encoder use.
 """
 from __future__ import annotations
 
@@ -38,6 +38,8 @@ class InceptionBlock(nn.Module):
             nn.init.zeros_(kernel.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,D,H,W] -> [B,E,H,W]; average parallel 2D kernels."""
+        # Stack K kernel outputs: [B,E,H,W,K] -> mean over K.
         return torch.stack([kernel(x) for kernel in self.kernels],
                            dim=-1).mean(dim=-1)
 
@@ -59,6 +61,7 @@ class MorletCWT(nn.Module):
                            else {})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,D,T] -> Morlet coefficients [B,D,8,T]."""
         if x.ndim != 3:
             raise ValueError("x must be [B,D,T]")
         coefficients, _ = ptwt.cwt(x, self.scales, "morl", **self.cwt_kwargs)
@@ -107,7 +110,8 @@ class WFTBlock(nn.Module):
                            else None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, length, channels = x.shape
+        """[B,T,D] -> [B,T,D], combining FFT periods and wavelet scales."""
+        _, length, _ = x.shape
         fft = torch.fft.rfft(x, dim=1)  # [B,F,D]
         if self.top_k > fft.size(1) - 1:
             raise ValueError("top_k exceeds the number of non-DC rFFT bins")
@@ -120,21 +124,28 @@ class WFTBlock(nn.Module):
             energy[0] = -torch.inf
             indices = torch.topk(energy, self.top_k).indices  # [K]
             weights = torch.softmax(fft.abs().mean(-1)[:, indices], dim=-1)
+            # [B,K] sample-specific weights for K selected frequency bins.
             for index in indices.tolist():
                 period = max(1, length // index)
                 padded_length = math.ceil(length / period) * period
                 padded = F.pad(rearrange(x, "b t d -> b d t"),
                                (0, padded_length - length))
+                # [B,T,D] -> [B,D,T] -> [B,D,Tpad].
                 grid = rearrange(padded, "b d (n p) -> b d n p", p=period)
+                # [B,D,Tpad] -> [B,D,Nperiod,period].
                 changed = self.period_conv(grid)  # [B,D,n,period]
                 series = rearrange(changed, "b d n p -> b (n p) d")
+                # [B,D,Nperiod,period] -> [B,Tpad,D] -> trim to [B,T,D].
                 period_outputs.append(series[:, :length])
             stacked = torch.stack(period_outputs, dim=-1)  # [B,T,D,K]
             global_path = (stacked * weights[:, None, None, :]).sum(dim=-1)
+            # [B,T,D,K] weighted over K -> [B,T,D].
 
         coeffs = self.cwt(rearrange(x, "b t d -> b d t"))
+        # [B,T,D] -> [B,D,T] -> CWT [B,D,8,T].
         local_grid = self.period_conv(coeffs)  # [B,D,8,T]
         local_path = self.scale_conv(local_grid).squeeze(2)
+        # Depthwise scale Conv: [B,D,8,T] -> [B,D,1,T] -> [B,D,T].
         local_path = rearrange(local_path, "b d t -> b t d")  # [B,T,D]
         if self.pwc_mode == "paper_adaptive" and self.top_k:
             # Paper's per-example PWC: mean over channels of max spectral
@@ -187,7 +198,7 @@ class WFTNetBlock(nn.Module):
         self.layers = nn.ModuleList([
             WFTBlock(d_model, d_ff, top_k, period_coeff, wavelet_scale,
                      num_kernels, pwc_mode, pwc_bins,
-                     seq_len=seq_len, pred_len=seq_len)
+                     seq_len=seq_len, pred_len=None)
             for _ in range(layers)
         ])
         self.norm = nn.LayerNorm(d_model)
@@ -199,29 +210,34 @@ class WFTNetBlock(nn.Module):
         positional[:, 0::2] = torch.sin(position * frequency)
         positional[:, 1::2] = torch.cos(position * frequency[:d_model // 2])
         self.register_buffer("positional", positional[None])
-        self.time_extension = nn.Linear(seq_len, 2 * seq_len)
-        self.projection = nn.Linear(d_model, in_dim)
-        self.output = nn.Linear(in_dim, out_dim)
+        # Forecast-only T->T+H expansion is not needed for an encoder. Decode
+        # every observed-position D-vector directly, without D->Cin bottleneck.
+        self.output = nn.Linear(d_model, out_dim)
+        # Normalization discards level/scale from the WFT path. This learned
+        # raw-input skip preserves access to that information downstream.
+        self.input_skip = nn.Linear(in_dim, out_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,T,Cin] -> [B,T,Cout] with no temporal extension or cropping."""
         if x.ndim != 3 or x.size(-1) != self.in_dim:
             raise ValueError("x must have shape [B,T,in_dim]")
         if x.size(1) != self.seq_len:
             raise ValueError("input length differs from seq_len")
-        mean = x.mean(dim=1, keepdim=True).detach()
+        mean = x.mean(dim=1, keepdim=True).detach()  # [B,1,Cin]
         centered = x - mean
         scale = (centered.var(dim=1, keepdim=True,
                               unbiased=False) + 1e-5).sqrt()
         normalized = centered / scale  # [B,T,Cin]
         embedded = self.input(rearrange(normalized, "b t c -> b c t"))
+        # [B,T,Cin] -> [B,Cin,T] -> Conv1d [B,D,T]; early series fusion.
         hidden = rearrange(embedded, "b d t -> b t d")  # [B,T,D]
         hidden = hidden + self.positional  # official DataEmbedding
-        hidden = rearrange(
-            self.time_extension(rearrange(hidden, "b t d -> b d t")),
-            "b d t -> b t d")  # [B,2T,D]
+        # Keep all T observed positions. WFT's FFT/CWT/period Conv process
+        # [B,T,D] and return [B,T,D]; no artificial future positions exist.
         for layer in self.layers:
-            hidden = self.norm(layer(hidden))
-        projected = self.projection(hidden)
-        projected = projected * scale + mean  # [B,2T or T,Cin]
-        projected = projected[:, -self.seq_len:]  # [B,T,Cin]
-        return self.output(projected)  # [B,T,Cout]
+            hidden = self.norm(layer(hidden))  # [B,T,D]
+        # Learned per-time readout [B,T,D] -> [B,T,Cout]. Unlike the former
+        # D->Cin->Cout path, no intermediate Cin bottleneck is introduced.
+        # The raw skip [B,T,Cin] -> [B,T,Cout] retains level/scale cues that
+        # instance normalization removes from the WFT branch.
+        return self.output(hidden) + self.input_skip(x)

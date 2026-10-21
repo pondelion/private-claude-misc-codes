@@ -88,10 +88,12 @@ class MambaBlock(nn.Module):
                 except (ImportError, AssertionError) as exc:
                     if backend == "official":
                         raise RuntimeError(
-                            "backend='official' needs the selected version and its kernels"
+                            "backend='official' needs the selected version "
+                            "and its kernels"
                         ) from exc
                     warnings.warn(
-                        f"Mamba-{version} official mixer unavailable ({exc}); using its PyTorch reference",
+                        f"Mamba-{version} official mixer unavailable "
+                        f"({exc}); using its PyTorch reference",
                         RuntimeWarning,
                         stacklevel=2)
             if official is not None:
@@ -109,16 +111,22 @@ class MambaBlock(nn.Module):
         self.output = nn.Linear(d_model, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Input [B,T,Cin] -> causal mixed features [B,T,Cout].
+
+        B=batch, T=time, D=d_model is the fixed hidden mixer width.
+        Each official/version-specific mixer keeps both T and D unchanged.
+        """
         if x.ndim != 3 or x.size(-1) != self.in_dim or x.size(1) < 1:
             raise ValueError(f"expected [B,T,{self.in_dim}]")
         # Lift input features: [B,T,Cin] -> [B,T,D].
-        h = self.input(x)
+        hidden_tokens = self.input(x)  # [B,T,Cin] -> [B,T,D].
         for norm, mixer in zip(self.norms, self.mixers):
             # Each causal mixer preserves [B,T,D]; residual keeps the signal.
-            h = h + self.dropout(mixer(norm(h)))
+            hidden_tokens = hidden_tokens + self.dropout(
+                mixer(norm(hidden_tokens)))
         # The official mixer has width D; this readout gives the requested
         # Cout without adding a second raw-input bypass around the mixer.
-        return self.output(h)
+        return self.output(hidden_tokens)  # [B,T,D] -> [B,T,Cout].
 
 
 if __name__ == "__main__":

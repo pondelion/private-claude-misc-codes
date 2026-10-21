@@ -82,14 +82,13 @@ Wavelet branch の 8 尺度は公式 `2**linspace(-1, wavelet_scale, 8)`。Incep
 
 ```text
 x [B,T,Cin] → window norm → circular Conv1d(Cin→D) + position [B,T,D]
-  → learned time extension(T→2T) [B,2T,D]
-  → WFTBlock(s) (FFT period map + ptwt Morlet CWT + fusion) [B,2T,D]
-  → LayerNorm + Linear(D→Cin) + inverse norm [B,2T,Cin]
-  → last T positions [B,T,Cin] → Linear(Cin→Cout) [B,T,Cout]
+  → WFTBlock(s) (FFT period map + ptwt Morlet CWT + fusion) [B,T,D]
+  → LayerNorm [B,T,D] → Linear(D→Cout) [B,T,Cout]
+  ＋ raw input x → Linear(Cin→Cout) [B,T,Cout]
   → 任意の head は外側
 ```
 
-構築時に `seq_len=T` を必ず指定する。公式と同じ時間拡張・位置 embedding・逆正規化・末尾 T 点を保持するためである。CWT も `ptwt.cwt(..., "morl")` を使う。公式指定の `ptwt==0.1.6` と導入版 `1.0.1` では既定の計算精度が異なるため、導入版には `precision=10` を指定する。旧版と CWT 係数が一致し、`top_k=0,2` とも公式 `Model.forward` の同長経路の出力が一致した。最後の `Cin→Cout` は汎用用途の追加射影である。
+構築時に `seq_len=T` を指定するのは位置 embedding と入力長の整合のため。**予測専用の `T→T+H` 拡張と末尾 H 点の切り出しは、この encoder には入れない。** 各時刻の D 次元特徴をそのまま `Cout` へ射影するため、`D→Cin→Cout` の中間ボトルネックもない。正規化で失われる平均・スケールを下流で利用できるよう、元入力からの学習可能な skip を加える。`Cout<Cin` の場合など、出力次元の制約による情報損失まで防ぐ保証はない。CWT は `ptwt.cwt(..., "morl")` を使う。公式指定の `ptwt==0.1.6` と導入版 `1.0.1` では既定精度が異なるため、後者には `precision=10` を指定する。
 
 ## 使い方・学習
 
@@ -120,7 +119,7 @@ FFT の各 bin は窓全体の周期強度であり、窓の前半だけ強い�
 
 論文での sample `b` の重みは、おおむね `α_b = (1/C) Σ_c max_{f≤m}|FFT[b,f,c]|² / Σ_{f≤m}|FFT[b,f,c]|²` という、支配的な単一周期へエネルギーが集中している度合い。`α_b≈1` なら強い大域周期、低いなら局所 branch の比率を増やす。α を 10 乗するので、例えば α=0.8 でも `α^10≈0.107` と Fourier branch はかなり抑えられる。固定 `period_coeff=0.8` を使う公開 forward は各 sample に応じてこの比率を変えない。本版の `paper_adaptive` は paper の意図を隠れ特徴 D 上で実装した別モードで、**公開 checkpoint の完全再現用ではない**。
 
-さらに `top_k=0` なら Fourier branch は存在せず wavelet-only になる。公開 `Wavelet.forward` はその場合だけ内部 `projection(seq_len+pred_len→pred_len)` を通る。本版も `seq_len` 指定時にはこの射影を含み、公式と出力照合した。
+さらに `top_k=0` なら Fourier branch は存在せず wavelet-only になる。公開 `Wavelet.forward` はその場合だけ内部の未来長 `projection(seq_len+pred_len→pred_len)` を通る。本版では `pred_len=None` としてこの**予測専用射影を使わず**、入力時刻 T 個の特徴を保持する。
 
 ## 原著の検証から何が言えるか
 
@@ -135,7 +134,7 @@ FFT の各 bin は窓全体の周期強度であり、窓の前半だけ強い�
 | CWT local map | `ptwt.cwt` | `MorletCWT` | 同じ 8 尺度・旧版と同じ計算精度 10 で係数一致 |
 | scale compression | depthwise `(8,1)` | `scale_conv` | 同じ軸と kernel shape |
 | blend | fixed `period_coeff**10` | `official_fixed`/`paper_adaptive` | 二つの定義を切り分ける |
-| 同長出力 | `T→T+H` と末尾 H 点 | `H=T`、末尾 T 点の後に `Cin→Cout` | 追加射影以外は同じ処理 |
+| 同長出力 | `T→T+H` と末尾 H 点 | T 個の WFT 特徴を保持して `D→Cout`、元入力 skip を加算 | 予測用拡張・切り出しは除外した汎用 encoder adapter |
 
 FFT は概ね `O(B D T log T)`、K 回の 2D 畳み込みは period map を合計 `K*T` 要素で処理する。CWT は 8 尺度の畳み込みで、その計算量は最大 wavelet filter 長に依存する。尺度を大きくすると計算量も増える。単に「FFT は速いから WFTNet 全体も速い」とは言えず、実際の `B,T,D,K,scale` でベンチマークする。
 
@@ -207,4 +206,4 @@ infer output: final H points [B,H,C]
 
 ## 一次資料・再現境界
 
-原論文: [WFTNet](https://arxiv.org/abs/2309.11319)。公式実装: [Hank0626/WFTNet](https://github.com/Hank0626/WFTNet)。照合箇所: 論文 `Template.tex`、公開 `models/Wavelet.py`, `layers/Conv_Blocks.py`, `layers/Embed.py`。公式指定 `ptwt==0.1.6` と本版の CWT 係数、ならびに `seq_len` 指定の正規化から公式 `Model.forward` の同長出力まで数値一致を確認した（`top_k=0,2`）。
+原論文: [WFTNet](https://arxiv.org/abs/2309.11319)。公式実装: [Hank0626/WFTNet](https://github.com/Hank0626/WFTNet)。照合箇所: 論文 `Template.tex`、公開 `models/Wavelet.py`, `layers/Conv_Blocks.py`, `layers/Embed.py`。CWT の precision 設定は公式指定の `ptwt==0.1.6` に合わせる。汎用 encoder の出力は未来予測用の時間拡張・切り出しを除いたため、公式 `Model.forward` の最終出力との数値一致対象ではない。
