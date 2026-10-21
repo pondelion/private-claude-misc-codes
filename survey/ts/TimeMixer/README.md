@@ -92,6 +92,12 @@ x [B,seq_len,Cin]
 
 `seq_len` と `down_sampling_window` を変えると尺度ごとの `Linear(T_m→T_(m±1))` の重み形状が変わるため再構築が必要。`down_sampling_method` は avg/max。公式の尺度別 Normalize と CI=0 の `pre_enc` seasonal 経路を block 内に保持する。公式の conv downsample と時刻 marker 経路は含めない。FMM は未来予測 head であり、同長特徴を返す本 block の外に置く。
 
+追加オプション（既定値はいずれも公式 forecast 経路と同一で、公式 parity は既定値で確認）:
+
+- `input_decomp`（既定 `True`）: CI=0 で埋め込み前に季節成分 `x−MA(x)` だけを渡す公式 `pre_enc` の挙動。窓内で一定の水準は `use_norm=False` でも完全に消える（数値確認済み）。`False` にすると入力をそのまま埋め込み、`use_norm=False` と組み合わせると公式 classification 経路と同じ入力になる。
+- `length_policy`（既定 `"strict"`）: 尺度ごとの pooling は切り捨てのため、`seq_len` が `down_sampling_window**down_sampling_layers` の倍数でないと粗い尺度から**直近**の時刻が落ちる（公式も同じ挙動で、公式の `seq_len=96` では問題にならない）。`"strict"` はそのような `seq_len` を構築時に `ValueError` で拒否する。`"crop_oldest"` は任意の `seq_len` を受け付け、各 pooling の前に**最も古い**余りを落とす。最細尺度と出力は全時刻を保つ。
+- 埋め込み `Conv1d` は公式 `TokenEmbedding` と同じ `kaiming_normal_(mode="fan_in", nonlinearity="leaky_relu")` で初期化する（重みを公式からコピーする parity 確認では初期化の差は検出されないため、明示的に合わせた）。
+
 ## 使い方・DataFrame 例
 
 ```python
@@ -167,7 +173,7 @@ mean pooling は時刻位置を潰した系列単位の例で、未来予測専�
 
 論文 PDM の概念式は `X^l = X^(l-1) + FeedForward(S-Mix+T-Mix)` と residual 付き。しかし公開 `PastDecomposableMixing.forward` の `channel_independence=0` 経路では、分解後に `cross_layer` を当てて mixed season+trend をそのまま返し、同じ形の外側 residual を加えない。`channel_independence=1` 経路では `ori+out_cross_layer(...)` がある。本版は公開経路のこの差を保持した。論文式の図だけから「どちらも同じ residual」と実装すると、重みを合わせても数値が変わる。
 
-また公開 forecast は入力時の scale 別 `Normalize` と `pre_enc` を使うが、classification では尺度ごとに直接 embedding して PDM へ渡す。本版はこの分類系の encoder 経路に近く、予測 path の trend 残差 head、future temporal feature、FMM を持たない。したがって下流回帰に使うときに「forecast で使った TimeMixer と完全同一」と呼ばない。保持したのは**多尺度の PDM 設計**である。
+また公開 forecast は入力時の scale 別 `Normalize` と `pre_enc` を使うが、classification では尺度ごとに直接 embedding して PDM へ渡す。本版は既定では forecast 側の入力経路（scale 別 Normalize と `pre_enc`）に従い、`use_norm=False, input_decomp=False` で classification 側と同じ入力経路になる。いずれの場合も予測 path の trend 残差 head、future temporal feature、FMM は持たない。したがって下流回帰に使うときに「forecast で使った TimeMixer と完全同一」と呼ばない。保持したのは**多尺度の PDM 設計**である。
 
 ## 処理別の形状チェック
 

@@ -99,6 +99,19 @@ class TimeMixerBlock(nn.Module):
     ``channel_independence=False`` retains multivariate interactions in the
     token embedding.  When True, every input channel is encoded separately
     with shared weights; the final projection fuses their learned features.
+
+    ``input_decomp=True`` (official forecast ``pre_enc``) embeds only the
+    seasonal part ``x - moving_avg(x)`` when channel_independence=False, so a
+    window-constant level per channel is invisible even with use_norm=False.
+    ``input_decomp=False`` embeds the (optionally normalized) input as is; with
+    use_norm=False this matches the official classification path's input.
+
+    ``length_policy``: pooling floors each scale, so a length that is not a
+    multiple of ``down_sampling_window`` would drop the *newest* steps from the
+    coarser scales.  ``"strict"`` (default) rejects seq_len unless it is a
+    multiple of ``down_sampling_window ** down_sampling_layers``.
+    ``"crop_oldest"`` accepts any seq_len and drops the *oldest* remainder
+    before each pooling step; the finest scale and the output keep all T steps.
     """
 
     def __init__(self,
@@ -114,7 +127,9 @@ class TimeMixerBlock(nn.Module):
                  dropout: float = 0.0,
                  channel_independence: bool = False,
                  down_sampling_method: str = "avg",
-                 use_norm: bool = True) -> None:
+                 use_norm: bool = True,
+                 input_decomp: bool = True,
+                 length_policy: str = "strict") -> None:
         super().__init__()
         if min(in_dim, out_dim, seq_len, d_model, d_ff, e_layers,
                down_sampling_window) < 1 or down_sampling_layers < 1:
@@ -123,6 +138,16 @@ class TimeMixerBlock(nn.Module):
             raise ValueError("moving_avg must be odd")
         if down_sampling_method not in {"avg", "max"}:
             raise ValueError("down_sampling_method must be avg or max")
+        if length_policy not in {"strict", "crop_oldest"}:
+            raise ValueError("length_policy must be strict or crop_oldest")
+        multiple = down_sampling_window**down_sampling_layers
+        if length_policy == "strict" and seq_len % multiple:
+            raise ValueError(
+                f"seq_len={seq_len} must be a multiple of "
+                f"down_sampling_window**down_sampling_layers={multiple} under "
+                "length_policy='strict' (otherwise pooling drops the newest "
+                "steps); use length_policy='crop_oldest' to drop the oldest "
+                "remainder instead")
         lengths = [seq_len]
         for _ in range(down_sampling_layers):
             lengths.append(lengths[-1] // down_sampling_window)
@@ -134,6 +159,7 @@ class TimeMixerBlock(nn.Module):
         self.method = down_sampling_method
         self.channel_independence = channel_independence
         self.use_norm = use_norm
+        self.input_decomp = input_decomp
         self.moving_avg = moving_avg
         # Released forecast path normalizes *each* input resolution before
         # embedding. Each scale owns independent affine parameters [Cin].
@@ -149,6 +175,10 @@ class TimeMixerBlock(nn.Module):
                                    padding=1,
                                    padding_mode="circular",
                                    bias=False)
+        # Official TokenEmbedding initialization (not PyTorch's Conv1d default).
+        nn.init.kaiming_normal_(self.embedding.weight,
+                                mode="fan_in",
+                                nonlinearity="leaky_relu")
         self.embed_dropout = nn.Dropout(dropout)
         self.pdm_blocks = nn.ModuleList([
             PastDecomposableMixing(lengths, d_model, d_ff, moving_avg, dropout,
@@ -171,6 +201,10 @@ class TimeMixerBlock(nn.Module):
         for _ in range(len(self.pdm_blocks[0].lengths) - 1):
             source = rearrange(scales[-1], "b t c -> b c t")
             # [B,T_i,Cin] -> [B,Cin,T_i] for temporal downsampling.
+            # Nonzero only under length_policy='crop_oldest': drop the oldest
+            # remainder so pooling keeps the newest steps.
+            remainder = source.size(-1) % self.window
+            source = source[..., remainder:]
             if self.method == "avg":
                 reduced = F.avg_pool1d(source, self.window)
             else:
@@ -188,7 +222,7 @@ class TimeMixerBlock(nn.Module):
                 scale = (scale - mean) / stdev
                 scale = (scale * self.norm_weight[index] +
                          self.norm_bias[index])  # [B,T_i,Cin]
-            if not self.channel_independence:
+            if not self.channel_independence and self.input_decomp:
                 # Official forecast pre_enc passes seasonal (not raw x) to
                 # DataEmbedding_wo_pos; the trend is reserved for its FMM.
                 scale = scale - moving_average(scale, self.moving_avg)

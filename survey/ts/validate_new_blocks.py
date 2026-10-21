@@ -64,7 +64,8 @@ def check_shapes_and_backward() -> None:
         ("CycleNet", "CycleNetBlock",
          lambda t: dict(seq_len=t, cycle_len=4, d_model=8)),
         ("TimeMixer", "TimeMixerBlock",
-         lambda t: dict(seq_len=t, d_model=8, d_ff=16, e_layers=1)),
+         lambda t: dict(seq_len=t, d_model=8, d_ff=16, e_layers=1,
+                        length_policy="crop_oldest")),
         ("FITS", "FITSBlock", lambda t: dict(cut_freq=4)),
     ]
     for name, class_name, options in cases:
@@ -124,6 +125,57 @@ def check_fits_lowpass() -> None:
     output = block(wave)
     assert output.abs().max() < 1e-5
     print("FITS high-frequency cut-off OK")
+
+
+def check_timemixer_options() -> None:
+    cls = load_block("TimeMixer").TimeMixerBlock
+    # length_policy='strict' (default) rejects lengths pooling would truncate.
+    try:
+        cls(3, 5, seq_len=17)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("strict length_policy must reject seq_len=17")
+    cls(3, 5, seq_len=16)
+    # crop_oldest: coarse scales drop the oldest remainder, keep the newest.
+    block = cls(3, 5, seq_len=19, length_policy="crop_oldest",
+                use_norm=False, input_decomp=False)
+
+    def embedded_scales(inp: torch.Tensor) -> list[torch.Tensor]:
+        seen = {}
+        hook = block.pdm_blocks[0].register_forward_pre_hook(
+            lambda module, args: seen.update(scales=args[0]))
+        with torch.no_grad():
+            block(inp)
+        hook.remove()
+        return seen["scales"]
+
+    x = torch.randn(2, 19, 3)
+    base = embedded_scales(x)
+    assert [s.size(1) for s in base] == [19, 9, 4]
+    x_new = x.clone()
+    x_new[:, -1] += 10.0  # newest step must reach the coarsest scale
+    x_old = x.clone()
+    x_old[:, 0] += 10.0  # oldest step is the cropped remainder
+    assert not torch.allclose(embedded_scales(x_new)[-1], base[-1])
+    assert torch.allclose(embedded_scales(x_old)[-1], base[-1])
+    # input_decomp: the seasonal-only official forecast input hides a
+    # window-constant level even without normalization; raw input does not.
+    level = torch.randn(1, 1, 3) * 3
+    for decomp, should_see in ((True, False), (False, True)):
+        torch.manual_seed(0)
+        block = cls(3, 5, seq_len=16, use_norm=False, input_decomp=decomp)
+        block.eval()
+        with torch.no_grad():
+            changed = not torch.allclose(block(x[:, :16] + level),
+                                         block(x[:, :16]), atol=1e-5)
+        assert changed == should_see, decomp
+    # Official TokenEmbedding init: kaiming_normal(fan_in, leaky_relu).
+    big = cls(400, 5, seq_len=16, d_model=64)
+    fan_in = 400 * 3
+    expected = torch.nn.init.calculate_gain("leaky_relu") / fan_in**0.5
+    assert abs(big.embedding.weight.std().item() / expected - 1) < 0.05
+    print("TimeMixer length_policy / input_decomp / embedding init OK")
 
 
 def check_ada_official_full(source: Path) -> None:
@@ -761,6 +813,7 @@ def main() -> None:
     check_shapes_and_backward()
     check_transforms()
     check_fits_lowpass()
+    check_timemixer_options()
     if args.official_root is not None:
         check_official_cores(args.official_root)
 
