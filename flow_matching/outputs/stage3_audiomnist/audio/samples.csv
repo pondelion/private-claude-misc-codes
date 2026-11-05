@@ -1,0 +1,101 @@
+file,group,ref_speaker,ref_gender,ref_digit,generated_digit,w,kind
+unseen_ref-spk46_digit0_0prompt-digit7.wav,unseen,46,male,7,,,prompt (real recording given as reference)
+unseen_ref-spk46_digit0_1generated_w0.0.wav,unseen,46,male,7,0,0.0,generated (Griffin-Lim)
+unseen_ref-spk46_digit0_1generated_w0.7.wav,unseen,46,male,7,0,0.7,generated (Griffin-Lim)
+unseen_ref-spk46_digit0_1generated_w2.0.wav,unseen,46,male,7,0,2.0,generated (Griffin-Lim)
+unseen_ref-spk46_digit0_2real.wav,unseen,46,male,7,0,,real recording of the same speaker & digit
+unseen_ref-spk46_digit0_3real_griffinlim.wav,unseen,46,male,7,0,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk48_digit1_0prompt-digit6.wav,unseen,48,male,6,,,prompt (real recording given as reference)
+unseen_ref-spk48_digit1_1generated_w0.0.wav,unseen,48,male,6,1,0.0,generated (Griffin-Lim)
+unseen_ref-spk48_digit1_1generated_w0.7.wav,unseen,48,male,6,1,0.7,generated (Griffin-Lim)
+unseen_ref-spk48_digit1_1generated_w2.0.wav,unseen,48,male,6,1,2.0,generated (Griffin-Lim)
+unseen_ref-spk48_digit1_2real.wav,unseen,48,male,6,1,,real recording of the same speaker & digit
+unseen_ref-spk48_digit1_3real_griffinlim.wav,unseen,48,male,6,1,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk49_digit2_0prompt-digit3.wav,unseen,49,male,3,,,prompt (real recording given as reference)
+unseen_ref-spk49_digit2_1generated_w0.0.wav,unseen,49,male,3,2,0.0,generated (Griffin-Lim)
+unseen_ref-spk49_digit2_1generated_w0.7.wav,unseen,49,male,3,2,0.7,generated (Griffin-Lim)
+unseen_ref-spk49_digit2_1generated_w2.0.wav,unseen,49,male,3,2,2.0,generated (Griffin-Lim)
+unseen_ref-spk49_digit2_2real.wav,unseen,49,male,3,2,,real recording of the same speaker & digit
+unseen_ref-spk49_digit2_3real_griffinlim.wav,unseen,49,male,3,2,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk50_digit3_0prompt-digit3.wav,unseen,50,male,3,,,prompt (real recording given as reference)
+unseen_ref-spk50_digit3_1generated_w0.0.wav,unseen,50,male,3,3,0.0,generated (Griffin-Lim)
+unseen_ref-spk50_digit3_1generated_w0.7.wav,unseen,50,male,3,3,0.7,generated (Griffin-Lim)
+unseen_ref-spk50_digit3_1generated_w2.0.wav,unseen,50,male,3,3,2.0,generated (Griffin-Lim)
+unseen_ref-spk50_digit3_2real.wav,unseen,50,male,3,3,,real recording of the same speaker & digit
+unseen_ref-spk50_digit3_3real_griffinlim.wav,unseen,50,male,3,3,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk51_digit4_0prompt-digit8.wav,unseen,51,male,8,,,prompt (real recording given as reference)
+unseen_ref-spk51_digit4_1generated_w0.0.wav,unseen,51,male,8,4,0.0,generated (Griffin-Lim)
+unseen_ref-spk51_digit4_1generated_w0.7.wav,unseen,51,male,8,4,0.7,generated (Griffin-Lim)
+unseen_ref-spk51_digit4_1generated_w2.0.wav,unseen,51,male,8,4,2.0,generated (Griffin-Lim)
+unseen_ref-spk51_digit4_2real.wav,unseen,51,male,8,4,,real recording of the same speaker & digit
+unseen_ref-spk51_digit4_3real_griffinlim.wav,unseen,51,male,8,4,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk53_digit5_0prompt-digit6.wav,unseen,53,male,6,,,prompt (real recording given as reference)
+unseen_ref-spk53_digit5_1generated_w0.0.wav,unseen,53,male,6,5,0.0,generated (Griffin-Lim)
+unseen_ref-spk53_digit5_1generated_w0.7.wav,unseen,53,male,6,5,0.7,generated (Griffin-Lim)
+unseen_ref-spk53_digit5_1generated_w2.0.wav,unseen,53,male,6,5,2.0,generated (Griffin-Lim)
+unseen_ref-spk53_digit5_2real.wav,unseen,53,male,6,5,,real recording of the same speaker & digit
+unseen_ref-spk53_digit5_3real_griffinlim.wav,unseen,53,male,6,5,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk54_digit6_0prompt-digit3.wav,unseen,54,male,3,,,prompt (real recording given as reference)
+unseen_ref-spk54_digit6_1generated_w0.0.wav,unseen,54,male,3,6,0.0,generated (Griffin-Lim)
+unseen_ref-spk54_digit6_1generated_w0.7.wav,unseen,54,male,3,6,0.7,generated (Griffin-Lim)
+unseen_ref-spk54_digit6_1generated_w2.0.wav,unseen,54,male,3,6,2.0,generated (Griffin-Lim)
+unseen_ref-spk54_digit6_2real.wav,unseen,54,male,3,6,,real recording of the same speaker & digit
+unseen_ref-spk54_digit6_3real_griffinlim.wav,unseen,54,male,3,6,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk55_digit7_0prompt-digit2.wav,unseen,55,male,2,,,prompt (real recording given as reference)
+unseen_ref-spk55_digit7_1generated_w0.0.wav,unseen,55,male,2,7,0.0,generated (Griffin-Lim)
+unseen_ref-spk55_digit7_1generated_w0.7.wav,unseen,55,male,2,7,0.7,generated (Griffin-Lim)
+unseen_ref-spk55_digit7_1generated_w2.0.wav,unseen,55,male,2,7,2.0,generated (Griffin-Lim)
+unseen_ref-spk55_digit7_2real.wav,unseen,55,male,2,7,,real recording of the same speaker & digit
+unseen_ref-spk55_digit7_3real_griffinlim.wav,unseen,55,male,2,7,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk59_digit8_0prompt-digit3.wav,unseen,59,female,3,,,prompt (real recording given as reference)
+unseen_ref-spk59_digit8_1generated_w0.0.wav,unseen,59,female,3,8,0.0,generated (Griffin-Lim)
+unseen_ref-spk59_digit8_1generated_w0.7.wav,unseen,59,female,3,8,0.7,generated (Griffin-Lim)
+unseen_ref-spk59_digit8_1generated_w2.0.wav,unseen,59,female,3,8,2.0,generated (Griffin-Lim)
+unseen_ref-spk59_digit8_2real.wav,unseen,59,female,3,8,,real recording of the same speaker & digit
+unseen_ref-spk59_digit8_3real_griffinlim.wav,unseen,59,female,3,8,,same real recording through Griffin-Lim (vocoder quality reference)
+unseen_ref-spk60_digit9_0prompt-digit4.wav,unseen,60,female,4,,,prompt (real recording given as reference)
+unseen_ref-spk60_digit9_1generated_w0.0.wav,unseen,60,female,4,9,0.0,generated (Griffin-Lim)
+unseen_ref-spk60_digit9_1generated_w0.7.wav,unseen,60,female,4,9,0.7,generated (Griffin-Lim)
+unseen_ref-spk60_digit9_1generated_w2.0.wav,unseen,60,female,4,9,2.0,generated (Griffin-Lim)
+unseen_ref-spk60_digit9_2real.wav,unseen,60,female,4,9,,real recording of the same speaker & digit
+unseen_ref-spk60_digit9_3real_griffinlim.wav,unseen,60,female,4,9,,same real recording through Griffin-Lim (vocoder quality reference)
+seen_ref-spk01_digit0_0prompt-digit8.wav,seen,1,male,8,,,prompt (real recording given as reference)
+seen_ref-spk01_digit0_1generated_w0.7.wav,seen,1,male,8,0,0.7,generated (Griffin-Lim)
+seen_ref-spk01_digit0_2real.wav,seen,1,male,8,0,,real recording of the same speaker & digit
+seen_ref-spk01_digit0_3real_griffinlim.wav,seen,1,male,8,0,,same real recording through Griffin-Lim (vocoder quality reference)
+seen_ref-spk02_digit1_0prompt-digit7.wav,seen,2,male,7,,,prompt (real recording given as reference)
+seen_ref-spk02_digit1_1generated_w0.7.wav,seen,2,male,7,1,0.7,generated (Griffin-Lim)
+seen_ref-spk02_digit1_2real.wav,seen,2,male,7,1,,real recording of the same speaker & digit
+seen_ref-spk02_digit1_3real_griffinlim.wav,seen,2,male,7,1,,same real recording through Griffin-Lim (vocoder quality reference)
+seen_ref-spk03_digit2_0prompt-digit8.wav,seen,3,male,8,,,prompt (real recording given as reference)
+seen_ref-spk03_digit2_1generated_w0.7.wav,seen,3,male,8,2,0.7,generated (Griffin-Lim)
+seen_ref-spk03_digit2_2real.wav,seen,3,male,8,2,,real recording of the same speaker & digit
+seen_ref-spk03_digit2_3real_griffinlim.wav,seen,3,male,8,2,,same real recording through Griffin-Lim (vocoder quality reference)
+seen_ref-spk04_digit3_0prompt-digit2.wav,seen,4,male,2,,,prompt (real recording given as reference)
+seen_ref-spk04_digit3_1generated_w0.7.wav,seen,4,male,2,3,0.7,generated (Griffin-Lim)
+seen_ref-spk04_digit3_2real.wav,seen,4,male,2,3,,real recording of the same speaker & digit
+seen_ref-spk04_digit3_3real_griffinlim.wav,seen,4,male,2,3,,same real recording through Griffin-Lim (vocoder quality reference)
+seen_ref-spk05_digit4_0prompt-digit0.wav,seen,5,male,0,,,prompt (real recording given as reference)
+seen_ref-spk05_digit4_1generated_w0.7.wav,seen,5,male,0,4,0.7,generated (Griffin-Lim)
+seen_ref-spk05_digit4_2real.wav,seen,5,male,0,4,,real recording of the same speaker & digit
+seen_ref-spk05_digit4_3real_griffinlim.wav,seen,5,male,0,4,,same real recording through Griffin-Lim (vocoder quality reference)
+swap_ref-spk46_0prompt-digit7.wav,swap,46,male,7,,,prompt (real recording given as reference)
+swap_ref-spk46_1generated_digit3_w0.7.wav,swap,46,male,7,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk48_0prompt-digit3.wav,swap,48,male,3,,,prompt (real recording given as reference)
+swap_ref-spk48_1generated_digit3_w0.7.wav,swap,48,male,3,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk49_0prompt-digit4.wav,swap,49,male,4,,,prompt (real recording given as reference)
+swap_ref-spk49_1generated_digit3_w0.7.wav,swap,49,male,4,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk50_0prompt-digit3.wav,swap,50,male,3,,,prompt (real recording given as reference)
+swap_ref-spk50_1generated_digit3_w0.7.wav,swap,50,male,3,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk51_0prompt-digit4.wav,swap,51,male,4,,,prompt (real recording given as reference)
+swap_ref-spk51_1generated_digit3_w0.7.wav,swap,51,male,4,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk53_0prompt-digit2.wav,swap,53,male,2,,,prompt (real recording given as reference)
+swap_ref-spk53_1generated_digit3_w0.7.wav,swap,53,male,2,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk54_0prompt-digit2.wav,swap,54,male,2,,,prompt (real recording given as reference)
+swap_ref-spk54_1generated_digit3_w0.7.wav,swap,54,male,2,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk55_0prompt-digit9.wav,swap,55,male,9,,,prompt (real recording given as reference)
+swap_ref-spk55_1generated_digit3_w0.7.wav,swap,55,male,9,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk59_0prompt-digit4.wav,swap,59,female,4,,,prompt (real recording given as reference)
+swap_ref-spk59_1generated_digit3_w0.7.wav,swap,59,female,4,3,0.7,generated with the same noise/length; only the prompt speaker differs
+swap_ref-spk60_0prompt-digit2.wav,swap,60,female,2,,,prompt (real recording given as reference)
+swap_ref-spk60_1generated_digit3_w0.7.wav,swap,60,female,2,3,0.7,generated with the same noise/length; only the prompt speaker differs
