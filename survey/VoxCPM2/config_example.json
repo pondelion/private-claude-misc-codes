@@ -1,0 +1,25 @@
+{
+  "vocab_size": 16000,
+  "patch_size": 4,
+  "latent_dim": 64,
+  "fsq_dim": 64,
+  "fsq_scale": 9,
+  "residual_layers": 2,
+  "residual_no_rope": true,
+  "base": {
+    "dim": 256,
+    "intermediate": 768,
+    "layers": 4,
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64
+  },
+  "local": {
+    "dim": 128,
+    "intermediate": 384,
+    "layers": 2,
+    "heads": 2,
+    "kv_heads": 2,
+    "head_dim": 64
+  }
+}

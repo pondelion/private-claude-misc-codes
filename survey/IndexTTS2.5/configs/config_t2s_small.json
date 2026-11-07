@@ -1,0 +1,4 @@
+{
+  "official_config_path": "checkpoints/IndexTTS-2.5/config.yaml",
+  "variant": {"layers": 8, "model_dim": 512, "heads": 8}
+}

@@ -1,0 +1,8 @@
+{
+  "official_config_path": "checkpoints/IndexTTS-2.5/config.yaml",
+  "variant": {
+    "vocos_dim": 128,
+    "vocos_intermediate_dim": 512,
+    "vocos_num_layers": 4
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "vocab_size": 36100,
+  "semantic_begin": 32000,
+  "semantic_size": 4096,
+  "codebook_size": 4096,
+  "num_codebooks": 10,
+  "eos_id": 2,
+  "scale_mcf": true,
+  "norm_fast_input": true,
+  "slow": {
+    "dim": 512,
+    "intermediate": 1536,
+    "layers": 8,
+    "heads": 8,
+    "kv_heads": 2,
+    "head_dim": 64
+  },
+  "fast": {
+    "dim": 256,
+    "intermediate": 768,
+    "layers": 4,
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64
+  }
+}

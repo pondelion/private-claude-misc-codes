@@ -1,0 +1,4 @@
+{
+  "official_config_path": "checkpoints/IndexTTS-2.5/config.yaml",
+  "variant": {"DiT.depth": 4, "DiT.hidden_dim": 256, "DiT.num_heads": 4}
+}
